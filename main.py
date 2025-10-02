@@ -6,10 +6,12 @@ from transformers import AutoTokenizer, GenerationConfig
 
 from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config, HuggingFaceGenerationAdapter
 
+from model import NeuronGPTOSSForCausalLM
+
 def parse_args():
     parser = argparse.ArgumentParser()
     
-    parser.add_argument("--model-path", type=str, default="/home/ubuntu/models/")
+    parser.add_argument("--model-path", type=str, default="/home/ubuntu/models/gpt-oss-20b/")
     parser.add_argument("--compiled-model-path", type=str,
                         default="/home/ubuntu/traced_model/")
     
@@ -27,7 +29,7 @@ def parse_args():
     # parser.add_argument("--torch-dtype", type=to_torch_dtype, default="bfloat16")
     # parser.add_argument("--batch-size", type=int, default=1)
     # parser.add_argument("--padding-side", type=str)
-    # parser.add_argument("--seq-len", type=int, default=64)
+    parser.add_argument("--seq-len", type=int, default=64)
     # parser.add_argument("--n-active-tokens", type=int)
     # parser.add_argument("--n-positions", type=int)
     # parser.add_argument("--max-context-length", type=int)
@@ -52,7 +54,7 @@ def parse_args():
     # parser.add_argument("--token-generation-buckets", nargs="+", type=int)
 
     # # Parallelism
-    # parser.add_argument("--tp-degree", type=int, default=2)
+    parser.add_argument("--tp-degree", dest="tp_degree", type=int, default=8)
 
     # # Kernels
     # parser.add_argument("--qkv-kernel-enabled", action="store_true")
@@ -80,11 +82,37 @@ def prepare_inference(model_cls, args):
     # Skip values not specified in the args to avoid setting values to None in the config.
     config_kwargs = copy.deepcopy(vars(args))
     config_kwargs = {k: v for k, v in config_kwargs.items() if v is not None}
+    
+     # Keys that belong to Neuron*Config
+    neuron_keys = {
+        # common MoE/Neuron runtime knobs; 
+        "tp_degree", "max_batch_size", "buckets",
+        "torch_dtype", "on_device_sampling_config",
+        # kernel toggles 
+        "qkv_kernel_enabled", "attn_kernel_enabled", "mlp_kernel_enabled",
+        "quantized_mlp_kernel_enabled", "rmsnorm_quantize_kernel_enabled",
+        "quantized_kernel_lower_bound", "mlp_kernel_fuse_residual_add",
+        "fused_qkv", "sequence_parallel_enabled", "flash_decoding_enabled",
+        "enable_bucketing", "bucket_n_active_tokens",
+        "context_encoding_buckets", "token_generation_buckets",
+    }
 
-    if args.on_device_sampling:
-        config_kwargs["on_device_sampling_config"] = OnDeviceSamplingConfig(**config_kwargs)
+    # Keys that *do not* belong to NeuronConfig 
+    generation_keys = {
+        "prompts", "top_k", "top_p", "temperature", "do_sample",
+        "dynamic", "pad_token_id", "global_topk"
+    }
+    path_keys = {"model_path", "compiled_model_path"}
+    driver_only = {"seq_len", "batch_size", "max_length", "tol_map", "padding_side"}
 
-    neuron_config = model_cls.get_neuron_config_cls()(**config_kwargs)
+    # Build kwargs for each consumer
+    neuron_kwargs = {k: config_kwargs[k] for k in neuron_keys if k in config_kwargs and config_kwargs[k] is not None}
+    # (Do NOT pass generation/path args into NeuronConfig)
+
+    # if args.on_device_sampling:
+    #     config_kwargs["on_device_sampling_config"] = OnDeviceSamplingConfig(**config_kwargs)
+
+    neuron_config = model_cls.get_neuron_config_cls()(**neuron_kwargs)
 
     config = model_cls.get_config_cls()(
         neuron_config, load_config=load_pretrained_config(args.model_path)
@@ -129,3 +157,18 @@ def prepare_inference(model_cls, args):
 
     return model, tokenizer, generation_config
 
+def main():
+    args = parse_args()
+
+    if not args.prompts:
+        args.prompts = ["I believe the meaning of life is"]
+    args.batch_size = len(args.prompts)
+    args.max_length = args.seq_len
+    args.tol_map = "{None: (1e-5, 0.05), 1000: (1e-5, 0.03), 50: (1e-5, 0.03), 5: (1e-5, 0.03)}"
+
+    model, tokenizer, generation_config = prepare_inference(NeuronGPTOSSForCausalLM, args)
+    
+    print("Compiled!")
+    
+if __name__ == "__main__":
+    main()
