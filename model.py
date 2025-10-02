@@ -16,8 +16,8 @@ from dataclasses import dataclass
 
 from neuronx_distributed_inference.modules.moe import initialize_moe_module
 
-from neuronx_distributed_inference.models.config import InferenceConfig, NeuronConfig  # noqa: E402
-from neuronx_distributed_inference.models.model_base import (  # noqa: E402
+from neuronx_distributed_inference.models.config import InferenceConfig, MoENeuronConfig
+from neuronx_distributed_inference.models.model_base import (
     NeuronBaseForCausalLM,
     NeuronBaseModel,
 )
@@ -70,10 +70,10 @@ def convert_gptoss_to_neuron_state_dict(gptoss_sd: dict, config):
 
     # Optional sanity checks (won't break if configs differ, just informative)
     try:
-        assert H == config.d_model
-        assert L == config.n_layers
-        assert E == config.ffn_config.moe_num_experts
-        assert I == config.ffn_config.ffn_hidden_size
+        assert H == config.hidden_size
+        assert L == config.num_hidden_layers
+        assert E == config.num_local_experts
+        assert I == config.intermediate_size
     except Exception:
         pass
 
@@ -158,50 +158,56 @@ def convert_gptoss_to_neuron_state_dict(gptoss_sd: dict, config):
     gc.collect()
     return nsd
     
+class NeuronGPTOSSConfig(MoENeuronConfig):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.fused_qkv = False
+
 class GPTOSSInferenceConfig(InferenceConfig):
-    def add_derived_config(self):
-        ...
-
     def get_required_attributes(self) -> List[str]:
-
+        return [
+        ]
 
     @classmethod
-    def get_neuron_config_cls(cls) -> Type[NeuronConfig]:
-
+    def get_neuron_config_cls(cls):
+        return NeuronGPTOSSConfig
     
 class NeuronMLPBlock(torch.nn.Module):
     def __init__(self, config: InferenceConfig):
+        super().__init__()
+        
         self.ffn = initialize_moe_module(
             config=config,
-            num_experts=config.ffn_config.moe_num_experts,
-            top_k=config.ffn_config.moe_top_k,
-            hidden_size=config.d_model,
-            intermediate_size=config.ffn_config.ffn_hidden_size,
-            hidden_act=config.ffn_config.ffn_act_fn["name"],
+            num_experts=config.num_local_experts,
+            top_k=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            hidden_act="silu",
         )
     
     def forward(self, x):
         return self.ffn(x)
 
-class NeuronGPTOSSAttentionBlock():
-    def __init__(self, config: InferenceConfig):
+# class NeuronGPTOSSAttentionBlock():
+#     def __init__(self, config: InferenceConfig):
         
-    def forward(self, x):
+        
+#     def forward(self, x):
         
 
 class NeuronGPTOSSBlock(nn.Module):
     def __init__(self, config: GPTOSSInferenceConfig, block_idx: int):
         super().__init__()
-        self.hidden_size = config.d_model
-        self.resid_pdrop = config.resid_pdrop
+        
+        self.hidden_size = config.hidden_size
         self.block_idx = block_idx
         
-        self.self_attn = NeuronGPTOSSAttentionBlock(config=config)
+        # self.self_attn = NeuronGPTOSSAttentionBlock(config=config)
         self.ffn = NeuronMLPBlock(config=config)
         
         # RMS Norm
-        self.input_rms_norm = nn.RMSNorm(config.d_model, bias=False)
-        self.post_attention_rms_norm = nn.RMSNorm(config.d_model, bias=False)
+        self.input_rms_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_rms_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # Final linear
         
     def forward(
@@ -213,7 +219,7 @@ class NeuronGPTOSSBlock(nn.Module):
         **kwargs,
     ):
         residual = hidden_states
-        hidden_states = self.input_rms_norm(hidden_states).to(device=hidden_states.dtype)
+        hidden_states = self.input_rms_norm(hidden_states).to(dtype=hidden_states.dtype)
         
         # Attention
         hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
@@ -226,7 +232,7 @@ class NeuronGPTOSSBlock(nn.Module):
         
         hidden_states = residual + hidden_states
         residual = hidden_states
-        hidden_states = self.post_attention_rms_norm(hidden_states).to(device=hidden_states.dtype)
+        hidden_states = self.post_attention_rms_norm(hidden_states).to(dtype=hidden_states.dtype)
         
         # MoE
         hidden_states = self.ffn(hidden_states)[0] # not sure why indexing
@@ -242,22 +248,30 @@ class NeuronGPTOSSModel(NeuronBaseModel):
     """
 
     def setup_attr_for_model(self, config: GPTOSSInferenceConfig):
-        self.emb_pdrop = config.emb_pdrop
+        # self.emb_pdrop = config.emb_pdrop
 
         # Needed for init_inference_optimization()
         self.on_device_sampling = config.neuron_config.on_device_sampling_config is not None
         self.tp_degree = config.neuron_config.tp_degree
-        self.hidden_size = config.d_model
-        self.num_attention_heads = config.n_heads
-        self.num_key_value_heads = config.attn_config.kv_n_heads
+        self.hidden_size = config.hidden_size
+        self.num_attention_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
         self.max_batch_size = config.neuron_config.max_batch_size
         self.buckets = config.neuron_config.buckets
 
     # TODO
     def init_model(self, config: InferenceConfig):
+        self.embed_tokens = nn.Embedding(
+            num_embeddings=config.vocab_size,
+            embedding_dim=config.hidden_size,
+            padding_idx=getattr(config, "pad_token_id", None),
+        ) # FIX
+        
         self.layers = nn.ModuleList(
-            [NeuronGPTOSSBlock(config, block_idx) for block_idx in range(config.n_layers)]
+            [NeuronGPTOSSBlock(config, block_idx) for block_idx in range(config.num_hidden_layers)]
         )
+        
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
 
 class NeuronGPTOSSForCausalLM(NeuronBaseForCausalLM):
@@ -268,7 +282,7 @@ class NeuronGPTOSSForCausalLM(NeuronBaseForCausalLM):
     _model_cls = NeuronGPTOSSModel
 
     @staticmethod
-    def load_hf_model(model_path):
+    def load_hf_model(model_path, **kwargs):
         return NeuronGPTOSSForCausalLM.from_pretrained(model_path, **kwargs)
     
     @staticmethod
