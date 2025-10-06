@@ -22,6 +22,9 @@ from neuronx_distributed_inference.models.model_base import (
     NeuronBaseModel,
 )
 
+from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase, NeuronAttentionBaseOutput
+
+
 # From https://github.com/openai/gpt-oss/blob/main/gpt_oss/torch/model.py
 # class ModelConfig:
 #     num_hidden_layers: int = 36
@@ -188,12 +191,80 @@ class NeuronMLPBlock(torch.nn.Module):
     def forward(self, x):
         return self.ffn(x)
 
-# class NeuronGPTOSSAttentionBlock():
-#     def __init__(self, config: InferenceConfig):
+class NeuronGPTOSSAttentionBlock():
+    """
+    GPT-OSS Attention block implemented using the NeuronAttentionBase class,
+    which leverages NKI kernels for optimal performance on AWS Trainium.
+    """
+    def __init__(self, config: GPTOSSInferenceConfig):
+        # Initialize the base class with parameters from the model config.
+        # This automatically sets up GQA-aware, tensor-parallel QKV and Output layers.
+        super().__init__(
+            config=config,
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=config.num_key_value_heads,
+            head_dim=config.head_dim,
+            qkv_bias=True,  # Set to True/False based on your model's architecture
+            o_bias=True,    # Set to True/False based on your model's architecture
+            rope_theta=config.rope_theta,
+        )
         
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        active_mask: Optional[torch.LongTensor] = None,
+        cos_cache: Optional[torch.Tensor] = None,
+        sin_cache: Optional[torch.Tensor] = None,
+        rmsnorm=None,
+        **kwargs,
+    ) -> NeuronAttentionBaseOutput:
         
-#     def forward(self, x):
+        # 1. Project inputs to Q, K, V tensors and apply Rotary Position Embeddings.
+        # This is a powerful helper method from the NeuronAttentionBase class.
+        Q, K, V, cos_cache, sin_cache, residual = self.prep_qkv_tensors(
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            past_key_value=past_key_value,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+            rmsnorm=rmsnorm,
+        )
+
+        is_token_gen = past_key_value is not None
+        bsz, _, q_len, _ = Q.shape
+
+        if is_token_gen:
+            # 2a. On token generation phase (decode), use the base class's optimized TKG attention.
+            attn_output = self.attention_tokengen(
+                Q, K, V, attention_mask, position_ids, past_key_value, active_mask
+            )
+            attn_output = attn_output.transpose(1, 2).contiguous()
+        else:
+            # 2b. On context encoding phase (prefill), this method is called.
+            # Internally, it determines the best strategy and calls the NKI Flash Attention kernel.
+            attn_output, K, V = self.attention_context_encode(
+                Q, K, V, q_len, bsz, attention_mask
+            )
         
+        # 3. Reshape and apply the final output projection.
+        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
+        attn_output = self.get_o_proj()(attn_output)
+        
+        # 4. Return the results using the standard NeuronAttentionBaseOutput dataclass.
+        present_key_value = (K, V)
+        return NeuronAttentionBaseOutput(
+            hidden_states=attn_output,
+            present_key_value=present_key_value,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+            residual=residual,
+        )
+        
+                
 
 class NeuronGPTOSSBlock(nn.Module):
     def __init__(self, config: GPTOSSInferenceConfig, block_idx: int):
