@@ -188,11 +188,11 @@ class NeuronMLPBlock(torch.nn.Module):
     def forward(self, x):
         return self.ffn(x)
 
-# class NeuronGPTOSSAttentionBlock():
-#     def __init__(self, config: InferenceConfig):
+class NeuronGPTOSSAttentionBlock():
+    def __init__(self, config: InferenceConfig):
         
         
-#     def forward(self, x):
+    def forward(self, x):
         
 
 class NeuronGPTOSSBlock(nn.Module):
