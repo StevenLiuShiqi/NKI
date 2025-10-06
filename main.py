@@ -5,6 +5,7 @@ import copy
 from transformers import AutoTokenizer, GenerationConfig
 
 from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config, HuggingFaceGenerationAdapter
+from neuronx_distributed_inference.utils.accuracy import get_generate_outputs
 
 from model import NeuronGPTOSSForCausalLM
 
@@ -66,6 +67,7 @@ def parse_args():
     # parser.add_argument("--mlp-kernel-fuse-residual-add", action="store_true")
 
     return parser.parse_args()
+
 
 
 def load_tokenizer(model_path, compiled_model_path, neuron_config):
@@ -157,6 +159,24 @@ def prepare_inference(model_cls, args):
 
     return model, tokenizer, generation_config
 
+def run_generation(model, tokenizer, prompts, generation_config):
+    print("\nGenerating outputs...")
+    print(f"Prompts: {prompts}")
+
+    _, output_tokens = get_generate_outputs(
+        model,
+        prompts,
+        tokenizer,
+        is_hf=False,
+        generation_config=generation_config,
+        max_length=model.neuron_config.max_length,
+    )
+
+    print("Generated outputs:")
+    for i, output_token in enumerate(output_tokens):
+        print(f"Output {i}: {output_token}")
+
+
 def main():
     args = parse_args()
 
@@ -169,6 +189,13 @@ def main():
     model, tokenizer, generation_config = prepare_inference(NeuronGPTOSSForCausalLM, args)
     
     print("Compiled!")
+    
+    run_generation(
+        model,
+        tokenizer,
+        args.prompts,
+        generation_config
+    )
     
 if __name__ == "__main__":
     main()
