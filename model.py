@@ -13,10 +13,14 @@ from typing import List, Optional, Tuple, Type
 import torch
 from torch import nn
 from dataclasses import dataclass
+from transformers import AutoModelForCausalLM
 
 from neuronx_distributed_inference.modules.moe import initialize_moe_module
 
 from neuronx_distributed_inference.models.config import InferenceConfig, MoENeuronConfig
+from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
+from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
+from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear
 from neuronx_distributed_inference.models.model_base import (
     NeuronBaseForCausalLM,
     NeuronBaseModel,
@@ -40,123 +44,176 @@ from neuronx_distributed_inference.models.model_base import (
 #     rope_scaling_factor: float = 32.0
 #     rope_ntk_alpha: float = 1.0
 #     rope_ntk_beta: float = 32.0
+import gc
+import re
+import torch
+import gc
+import re
+import torch
 
-def convert_gptoss_to_neuron_state_dict(gptoss_sd: dict, config):
+def convert_gptoss_to_neuron_state_dict(
+    gptoss_sd: dict,
+    config,
+    *,
+    target_dtype=None,      # e.g., torch.bfloat16
+    target_device="cpu",    # keep CPU for loader
+    gc_every=2,
+    inplace_pop=True
+):
     """
-    Convert GPT-OSS state_dict (keys like 'model.layers.X...') into Neuron MoE format
-    (keys like 'layers.X...') using the measured shapes you provided.
+    Convert GPT-OSS checkpoint to NXD (trace) expected keys.
 
-    Measured (layer 0):
-      H=2880, L=24
-      qW=(4096,2880), kW=(512,2880), vW=(512,2880)  -> packed Wqkv=(5120,2880), biases present
-      o_proj=(2880,4096) with bias
-      router.weight=(32,2880), router.bias=(32,)
-      gate_up_proj=(32,2880,5760)  [E,H,2I], bias=(32,5760)
-      down_proj   =(32,2880,2880)  [E,H,I],  bias=(32,2880)
+    Emits keys:
+      layers.{L}.self_attn.qkv_proj.{q_proj,k_proj,v_proj}.{weight,bias}
+      layers.{L}.self_attn.o_proj.o_proj.{weight,bias}
+      layers.{L}.ffn.router.linear_router.{weight,bias}
+      layers.{L}.ffn.expert_mlps.mlp_op.{gate_up_proj,down_proj}.{weight,bias}
+      layers.{L}.{input_layernorm,post_attention_layernorm}.weight
+      embed_tokens.weight, norm.weight, lm_head.weight
+
+    Silently drops non-parameter buffers like self_attn.sinks.
     """
 
-    nsd = {}
+    def take(key, default=None, *, pop=inplace_pop):
+        if pop:
+            return gptoss_sd.pop(key, default)
+        return gptoss_sd.get(key, default)
 
-    # ---- Top level ----
-    nsd["embed_tokens.weight"] = gptoss_sd["model.embed_tokens.weight"].clone().detach()
-    nsd["norm.weight"]         = gptoss_sd["model.norm.weight"].clone().detach()
-    nsd["lm_head.weight"]      = gptoss_sd["lm_head.weight"].clone().detach()
+    def first_present(*keys):
+        for k in keys:
+            if k in gptoss_sd and gptoss_sd[k] is not None:
+                return take(k)
+        return None
 
-    # ---- Sizes (trust tensors; assert against config) ----
-    H = nsd["embed_tokens.weight"].shape[1]                      # 2880
-    L = len([k for k in gptoss_sd.keys() if k.startswith("model.layers.") and k.endswith(".input_layernorm.weight")])
-    E = gptoss_sd["model.layers.0.mlp.experts.gate_up_proj"].shape[0]        # 32
-    I = gptoss_sd["model.layers.0.mlp.experts.gate_up_proj"].shape[2] // 2   # 2880
-
-    # Optional sanity checks (won't break if configs differ, just informative)
-    try:
-        assert H == config.hidden_size
-        assert L == config.num_hidden_layers
-        assert E == config.num_local_experts
-        assert I == config.intermediate_size
-    except Exception:
-        pass
-
-    def pack_qkv(q_w, k_w, v_w):
-        # shapes: (4096,2880), (512,2880), (512,2880) -> (5120,2880)
-        assert q_w.dim() == k_w.dim() == v_w.dim() == 2
-        assert q_w.shape[1] == k_w.shape[1] == v_w.shape[1] == H
-        return torch.cat([q_w, k_w, v_w], dim=0)
-
-    def cat_biases(q_b, k_b, v_b):
-        if q_b is None or k_b is None or v_b is None:
+    def to_target(x):
+        if x is None:
             return None
-        return torch.cat([q_b.view(-1), k_b.view(-1), v_b.view(-1)], dim=0)
+        if target_dtype is not None and x.dtype != target_dtype:
+            x = x.to(dtype=target_dtype, copy=False)
+        if target_device is not None and (getattr(x, "device", None) is None or x.device.type != target_device):
+            x = x.to(device=target_device, copy=False)
+        return x
 
-    for l in range(L):
-        # --- Attention ---
-        q_w = gptoss_sd[f"model.layers.{l}.self_attn.q_proj.weight"].clone().detach()
-        k_w = gptoss_sd[f"model.layers.{l}.self_attn.k_proj.weight"].clone().detach()
-        v_w = gptoss_sd[f"model.layers.{l}.self_attn.v_proj.weight"].clone().detach()
-        nsd[f"layers.{l}.self_attn.Wqkv.weight"] = pack_qkv(q_w, k_w, v_w)
+    with torch.no_grad():
+        nsd = {}
 
-        q_b = gptoss_sd.get(f"model.layers.{l}.self_attn.q_proj.bias")
-        k_b = gptoss_sd.get(f"model.layers.{l}.self_attn.k_proj.bias")
-        v_b = gptoss_sd.get(f"model.layers.{l}.self_attn.v_proj.bias")
-        wqkv_b = cat_biases(q_b, k_b, v_b)
-        if wqkv_b is not None:
-            nsd[f"layers.{l}.self_attn.Wqkv.bias"] = wqkv_b.clone().detach()
+        # ---- Top-level ----
+        etw = first_present("embed_tokens.weight", "model.embed_tokens.weight")
+        assert etw is not None, "Missing embed_tokens.weight"
+        nsd["embed_tokens.weight"] = to_target(etw)
 
-        nsd[f"layers.{l}.self_attn.o_proj.weight"] = (
-            gptoss_sd[f"model.layers.{l}.self_attn.o_proj.weight"].clone().detach()
-        )
-        o_b = gptoss_sd.get(f"model.layers.{l}.self_attn.o_proj.bias")
-        if o_b is not None:
-            nsd[f"layers.{l}.self_attn.o_proj.bias"] = o_b.clone().detach()
+        nw = first_present("norm.weight", "model.norm.weight")
+        assert nw is not None, "Missing norm.weight"
+        nsd["norm.weight"] = to_target(nw)
 
-        # --- Router ---
-        r_w = gptoss_sd[f"model.layers.{l}.mlp.router.weight"].clone().detach()  # (E,H)
-        # If ever stored as (H,E), transpose -> (E,H)
-        if r_w.shape == (H, E):
-            r_w = r_w.t()
-        nsd[f"layers.{l}.ffn.router.linear_router.weight"] = r_w
-        r_b = gptoss_sd.get(f"model.layers.{l}.mlp.router.bias")
-        if r_b is not None:
-            nsd[f"layers.{l}.ffn.router.linear_router.bias"] = r_b.clone().detach()
+        lmh = first_present("lm_head.weight", "model.lm_head.weight")
+        assert lmh is not None, "Missing lm_head.weight"
+        nsd["lm_head.weight"] = to_target(lmh)
 
-        # --- Experts ---
-        gate_up = gptoss_sd[f"model.layers.{l}.mlp.experts.gate_up_proj"].clone().detach()  # expect [E,H,2I]
-        assert gate_up.shape == (E, H, 2 * I), f"gate_up shape {gate_up.shape} != (E,H,2I)"
-        nsd[f"layers.{l}.ffn.expert_mlps.mlp_op.gate_up_proj.weight"] = gate_up
+        # ---- Infer dims from config / tensors ----
+        H = int(getattr(config, "hidden_size", nsd["embed_tokens.weight"].shape[1]))
+        # Find one gate_up to infer (E, H, 2I)
+        gate_key = None
+        for k in list(gptoss_sd.keys()):
+            if k.endswith(".mlp.experts.gate_up_proj"):
+                gate_key = k; break
+        assert gate_key is not None, "Cannot infer expert dims; gate_up_proj not found."
+        E = gptoss_sd[gate_key].shape[0]
+        H_chk = gptoss_sd[gate_key].shape[1]
+        I = gptoss_sd[gate_key].shape[2] // 2
+        assert H == H_chk, f"H mismatch: config={H} vs gate_up={H_chk}"
 
-        down = gptoss_sd[f"model.layers.{l}.mlp.experts.down_proj"].clone().detach()        # given [E,H,I]
-        if down.shape == (E, H, I):
-            down = down.transpose(1, 2)   # -> [E,I,H]
-        elif down.shape != (E, I, H):
-            raise ValueError(f"Unexpected down_proj shape {down.shape}")
-        nsd[f"layers.{l}.ffn.expert_mlps.mlp_op.down_proj.weight"] = down
+        # ---- Layer ids present in the GPT-OSS dict ----
+        layer_ids = sorted({
+            int(m.group(1))
+            for k in gptoss_sd.keys()
+            if k.startswith("model.layers.") and (m := re.match(r"model.layers\.(\d+)\.", k))
+        })
 
-        gub = gptoss_sd.get(f"model.layers.{l}.mlp.experts.gate_up_proj_bias")  # (E,2I)
-        if gub is not None:
-            nsd[f"layers.{l}.ffn.expert_mlps.mlp_op.gate_up_proj.bias"] = gub.clone().detach()
-        dpb = gptoss_sd.get(f"model.layers.{l}.mlp.experts.down_proj_bias")     # (E,I)
-        if dpb is not None:
-            nsd[f"layers.{l}.ffn.expert_mlps.mlp_op.down_proj.bias"] = dpb.clone().detach()
+        for idx, L in enumerate(layer_ids):
+            # ===== Attention: q/k/v -> qkv_proj.{q_proj,k_proj,v_proj}.{weight,bias}
+            for proj in ("q", "k", "v"):
 
-        # --- Norms ---
-        nsd[f"layers.{l}.input_layernorm.weight"] = (
-            gptoss_sd[f"model.layers.{l}.input_layernorm.weight"].clone().detach()
-        )
-        nsd[f"layers.{l}.post_attention_layernorm.weight"] = (
-            gptoss_sd[f"model.layers.{l}.post_attention_layernorm.weight"].clone().detach()
-        )
+                w = take(f"model.layers.{L}.self_attn.{proj}_proj.weight", None)
+                if w is not None:
+                    nsd[f"layers.{L}.self_attn.qkv_proj.{proj}_proj.weight"] = to_target(w)
+                b = take(f"model.layers.{L}.self_attn.{proj}_proj.bias", None)
+                if b is not None:
+                    nsd[f"layers.{L}.self_attn.qkv_proj.{proj}_proj.bias"] = to_target(b)
 
-        # --- TP metadata (same spirit as your DBRX script) ---
-        nsd[f"layers.{l}.self_attn.rank_util.rank"] = torch.arange(
-            0, config.neuron_config.tp_degree, dtype=torch.int32
-        )
+            # ===== Attention: out-proj -> o_proj.o_proj.{weight,bias}
+            ow = take(f"model.layers.{L}.self_attn.o_proj.weight", None)
+            if ow is not None:
+                nsd[f"layers.{L}.self_attn.o_proj.o_proj.weight"] = to_target(ow)
+            ob = take(f"model.layers.{L}.self_attn.o_proj.bias", None)
+            if ob is not None:
+                nsd[f"layers.{L}.self_attn.o_proj.o_proj.bias"] = to_target(ob)
 
-        # NOTE: 'model.layers.{l}.self_attn.sinks' is a buffer for sliding attention; intentionally skipped.
+            # Drop sinks buffer if present
+            _buf = take(f"model.layers.{L}.self_attn.sinks", None)
+            _buf = None
 
-    # Cleanup
-    gptoss_sd.clear()
-    gc.collect()
-    return nsd
+            # ===== Router -> ffn.router.linear_router.{weight,bias}
+            rw = take(f"model.layers.{L}.mlp.router.weight", None)
+            if rw is not None:
+                # Some GPT-OSS exports as [H,E]; NXD expects [E,H]
+                if rw.shape == (H, E):
+                    rw = rw.t().contiguous()
+                elif rw.shape != (E, H):
+                    raise ValueError(f"router.weight[{L}] has shape {rw.shape}, expected (E,H) or (H,E)")
+                nsd[f"layers.{L}.ffn.ffn.router.linear_router.weight"] = to_target(rw)
+
+            rb = take(f"model.layers.{L}.mlp.router.bias", None)
+            if rb is not None:
+                # Expect [E]
+                if rb.dim() != 1 or rb.numel() != E:
+                    raise ValueError(f"router.bias[{L}] has shape {tuple(rb.shape)}, expected ({E},)")
+                nsd[f"layers.{L}.ffn.ffn.router.linear_router.bias"] = to_target(rb)
+
+            # ===== Experts -> ffn.expert_mlps.mlp_op.{gate_up_proj,down_proj}.{weight,bias}
+            gu = take(f"model.layers.{L}.mlp.experts.gate_up_proj", None)
+            if gu is not None:
+                if gu.shape != (E, H, 2*I):
+                    raise ValueError(f"gate_up_proj[{L}] {gu.shape} != (E,H,2I)=({E},{H},{2*I})")
+                nsd[f"layers.{L}.ffn.ffn.expert_mlps.mlp_op.gate_up_proj.weight"] = to_target(gu)
+
+            gub = take(f"model.layers.{L}.mlp.experts.gate_up_proj_bias", None)
+            if gub is not None:
+                if gub.shape != (E, 2*I):
+                    raise ValueError(f"gate_up_proj_bias[{L}] {gub.shape} != (E,2I)=({E},{2*I})")
+                nsd[f"layers.{L}.ffn.ffn.expert_mlps.mlp_op.gate_up_proj.bias"] = to_target(gub)
+
+            dp = take(f"model.layers.{L}.mlp.experts.down_proj", None)
+            if dp is not None:
+                if dp.shape == (E, H, I):
+                    dp = dp.transpose(1, 2).contiguous()  # -> [E, I, H]
+                if dp.shape != (E, I, H):
+                    raise ValueError(f"down_proj[{L}] {dp.shape} != (E,I,H)=({E},{I},{H})")
+                nsd[f"layers.{L}.ffn.ffn.expert_mlps.mlp_op.down_proj.weight"] = to_target(dp)
+
+            dpb = take(f"model.layers.{L}.mlp.experts.down_proj_bias", None)
+            if dpb is not None:
+                if dpb.shape != (E, H):
+                    raise ValueError(f"down_proj_bias[{L}] {dpb.shape} != (E,H)=({E},{H})")
+                nsd[f"layers.{L}.ffn.ffn.expert_mlps.mlp_op.down_proj.bias"] = to_target(dpb)
+
+            # ===== Norms 
+            iln = take(f"model.layers.{L}.input_layernorm.weight", None)
+            if iln is not None:
+                nsd[f"layers.{L}.input_layernorm.weight"] = to_target(iln)
+
+            paln = take(f"model.layers.{L}.post_attention_layernorm.weight", None)
+            if paln is not None:
+                nsd[f"layers.{L}.post_attention_layernorm.weight"] = to_target(paln)
+
+            if gc_every and (idx % gc_every == 0):
+                gc.collect()
+
+        # Clean up source and return
+        gptoss_sd.clear()
+        gc.collect()
+        return nsd
+
     
 class NeuronGPTOSSConfig(MoENeuronConfig):
     def __init__(self, **kwargs):
@@ -166,6 +223,10 @@ class NeuronGPTOSSConfig(MoENeuronConfig):
 class GPTOSSInferenceConfig(InferenceConfig):
     def get_required_attributes(self) -> List[str]:
         return [
+        "hidden_size", "num_attention_heads", "num_key_value_heads",
+        "head_dim", "vocab_size", "max_position_embeddings",
+        "num_hidden_layers", "rms_norm_eps", "pad_token_id",
+        # MoE
         ]
 
     @classmethod
@@ -188,11 +249,25 @@ class NeuronMLPBlock(torch.nn.Module):
     def forward(self, x):
         return self.ffn(x)
 
-# class NeuronGPTOSSAttentionBlock():
-#     def __init__(self, config: InferenceConfig):
+class NeuronGPTOSSAttentionBlock(NeuronAttentionBase):
+    def __init__(self, config: InferenceConfig):
+        rotary_emb = RotaryEmbedding(
+            dim=config.head_dim,                                     # ← 64 (matches Q/K last dim)
+            max_position_embeddings=config.max_position_embeddings,  # 131072 from config
+            base=config.rope_theta,                                  # 150000 from config
+        )
         
-        
-#     def forward(self, x):
+        super().__init__(
+            config=config,
+            hidden_size=config.hidden_size,
+            head_dim=config.head_dim,
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=config.num_key_value_heads,
+            rms_norm_eps=config.rms_norm_eps,
+            rotary_emb=rotary_emb,
+            qkv_bias=True,     # <-- set to True if your checkpoint has q/k/v biases
+            o_bias=True,
+        )
         
 
 class NeuronGPTOSSBlock(nn.Module):
@@ -202,12 +277,12 @@ class NeuronGPTOSSBlock(nn.Module):
         self.hidden_size = config.hidden_size
         self.block_idx = block_idx
         
-        # self.self_attn = NeuronGPTOSSAttentionBlock(config=config)
+        self.self_attn = NeuronGPTOSSAttentionBlock(config=config)
         self.ffn = NeuronMLPBlock(config=config)
         
         # RMS Norm
-        self.input_rms_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_rms_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # Final linear
         
     def forward(
@@ -219,7 +294,7 @@ class NeuronGPTOSSBlock(nn.Module):
         **kwargs,
     ):
         residual = hidden_states
-        hidden_states = self.input_rms_norm(hidden_states).to(dtype=hidden_states.dtype)
+        hidden_states = self.input_layernorm(hidden_states).to(dtype=hidden_states.dtype)
         
         # Attention
         hidden_states, present_key_value, cos_cache, sin_cache = self.self_attn(
@@ -232,7 +307,7 @@ class NeuronGPTOSSBlock(nn.Module):
         
         hidden_states = residual + hidden_states
         residual = hidden_states
-        hidden_states = self.post_attention_rms_norm(hidden_states).to(dtype=hidden_states.dtype)
+        hidden_states = self.post_attention_layernorm(hidden_states).to(dtype=hidden_states.dtype)
         
         # MoE
         hidden_states = self.ffn(hidden_states)[0] # not sure why indexing
@@ -272,21 +347,30 @@ class NeuronGPTOSSModel(NeuronBaseModel):
         )
         
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.lm_head = ColumnParallelLinear(
+            config.hidden_size,
+            config.vocab_size,
+            gather_output=not self.on_device_sampling,
+            bias=False,
+            pad=True,
+            # tensor_model_parallel_group=get_tp_group(config),
+        )
 
 
 class NeuronGPTOSSForCausalLM(NeuronBaseForCausalLM):
     """
     This class can be used as GPTOSSForCausalLM
     """
-
+    _STATE_DICT_MODEL_PREFIX = "transformer."
     _model_cls = NeuronGPTOSSModel
 
     @staticmethod
     def load_hf_model(model_path, **kwargs):
-        return NeuronGPTOSSForCausalLM.from_pretrained(model_path, **kwargs)
+        return AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
     
     @staticmethod
     def convert_hf_to_neuron_state_dict(state_dict: dict, config: InferenceConfig) -> dict:
+        print(f"STATE DICT: {state_dict.keys()}")
         return convert_gptoss_to_neuron_state_dict(state_dict, config)
 
     @classmethod
