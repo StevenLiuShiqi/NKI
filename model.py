@@ -191,7 +191,11 @@ class NeuronMLPBlock(torch.nn.Module):
     def forward(self, x):
         return self.ffn(x)
 
-class NeuronGPTOSSAttentionBlock():
+# ---------------------------------------------------------------
+# Attention
+# ---------------------------------------------------------------
+
+class NeuronGPTOSSAttentionBlock(NeuronAttentionBase):
     """
     GPT-OSS Attention block implemented using the NeuronAttentionBase class,
     which leverages NKI kernels for optimal performance on AWS Trainium.
@@ -200,10 +204,12 @@ class NeuronGPTOSSAttentionBlock():
         # Initialize the base class with parameters from the model config.
         # This automatically sets up GQA-aware, tensor-parallel QKV and Output layers.
         super().__init__(
+            # Settings not default
             config=config,
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
             num_key_value_heads=config.num_key_value_heads,
+            # Default settings
             head_dim=config.head_dim,
             qkv_bias=True,  # Set to True/False based on your model's architecture
             o_bias=True,    # Set to True/False based on your model's architecture
