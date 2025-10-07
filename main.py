@@ -12,7 +12,7 @@ from model import NeuronGPTOSSForCausalLM
 def parse_args():
     parser = argparse.ArgumentParser()
     
-    parser.add_argument("--model-path", type=str, default="/home/ubuntu/models/gpt-oss-20b-bf16/")
+    parser.add_argument("--model-path", type=str, default="/home/ubuntu/models/gpt-oss-20b/")
     parser.add_argument("--compiled-model-path", type=str,
                         default="/home/ubuntu/traced_model/")
     
@@ -71,7 +71,7 @@ def parse_args():
 
 
 def load_tokenizer(model_path, compiled_model_path, neuron_config):
-    tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side=neuron_config.padding_side)
+    tokenizer = AutoTokenizer.from_pretrained("openai/gpt-oss-20b", padding_side=neuron_config.padding_side)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.save_pretrained(compiled_model_path)
     return tokenizer
