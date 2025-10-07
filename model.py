@@ -204,7 +204,7 @@ class NeuronGPTOSSAttentionBlock(NeuronAttentionBase):
         # Initialize the base class with parameters from the model config.
         # This automatically sets up GQA-aware, tensor-parallel QKV and Output layers.
         super().__init__(
-            # Settings not default
+            # Custom settings
             config=config,
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
