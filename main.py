@@ -12,7 +12,7 @@ from model import NeuronGPTOSSForCausalLM
 def parse_args():
     parser = argparse.ArgumentParser()
     
-    parser.add_argument("--model-path", type=str, default="/home/ubuntu/models/gpt-oss-20b-bf16/")
+    parser.add_argument("--model-path", type=str, default="/home/ubuntu/models/gpt-oss-20b/")
     parser.add_argument("--compiled-model-path", type=str,
                         default="/home/ubuntu/traced_model/")
     
