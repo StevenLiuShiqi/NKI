@@ -71,7 +71,7 @@ def parse_args():
 
 
 def load_tokenizer(model_path, compiled_model_path, neuron_config):
-    tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side=neuron_config.padding_side)
+    tokenizer = AutoTokenizer.from_pretrained("openai/gpt-oss-20b", padding_side=neuron_config.padding_side)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.save_pretrained(compiled_model_path)
     return tokenizer
