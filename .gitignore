@@ -1,0 +1,11 @@
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+
+*.py[cod]
+*.pt
+*.pth
+*.ckpt
+
+artifacts/
+checkpoints/
