@@ -232,7 +232,7 @@ class NeuronGPTOSSMLPBlock(torch.nn.Module):
         self.world_size = 1
         
         # RMSNorm
-        self.norm = RMSNorm(config.hidden_size, device=device)
+        # self.norm = RMSNorm(config.hidden_size, device=device)
         
         # Create Router (replaces self.gate)
         self.router = RouterTopK(
@@ -268,11 +268,12 @@ class NeuronGPTOSSMLPBlock(torch.nn.Module):
         # Original: x → norm → gate → topk → expert_mlps → weighted_sum → x + residual
         # With MoE blocks: x → MoE (does all of the above) → x + residual
 
-        t = self.norm(x)
+        t = x
         _, expert_affinities, expert_index = self.router(t)
+        t_flat = t.view(-1, t.shape[-1])  # (B*S, H)
         seq_len = x.shape[1]
         moe_output = self.expert_mlps(
-            hidden_states=t,
+            hidden_states=t_flat,
             expert_affinities=expert_affinities,
             expert_index=expert_index,
             seq_len=seq_len

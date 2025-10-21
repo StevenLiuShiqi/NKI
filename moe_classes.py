@@ -243,7 +243,7 @@ class NeuronMLPBlock(torch.nn.Module):
         # If you want to separate norm from MoE:
         t = self.norm(x)
         router_logits, expert_affinities, expert_index = self.router(t)
-        # t_flat = t.view(-1, t.shape[-1])  # (B*S, H)
+        t_flat = t.view(-1, t.shape[-1])  # (B*S, H)
         seq_len = x.shape[1]
         moe_output = self.expert_mlps(
             hidden_states=t,
