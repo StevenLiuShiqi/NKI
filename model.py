@@ -146,27 +146,27 @@ def convert_gptoss_to_neuron_state_dict(
                     rw = rw.t().contiguous()
                 elif rw.shape != (E, H):
                     raise ValueError(f"router.weight[{L}] has shape {rw.shape}, expected (E,H) or (H,E)")
-                nsd[f"layers.{L}.ffn.ffn.router.linear_router.weight"] = to_target(rw)
+                nsd[f"layers.{L}.ffn.router.linear_router.weight"] = to_target(rw)
 
             rb = take(f"model.layers.{L}.mlp.router.bias", None)
             if rb is not None:
                 # Expect [E]
                 if rb.dim() != 1 or rb.numel() != E:
                     raise ValueError(f"router.bias[{L}] has shape {tuple(rb.shape)}, expected ({E},)")
-                nsd[f"layers.{L}.ffn.ffn.router.linear_router.bias"] = to_target(rb)
+                nsd[f"layers.{L}.ffn.router.linear_router.bias"] = to_target(rb)
 
             # ===== Experts -> ffn.expert_mlps.mlp_op.{gate_up_proj,down_proj}.{weight,bias}
             gu = take(f"model.layers.{L}.mlp.experts.gate_up_proj", None)
             if gu is not None:
                 if gu.shape != (E, H, 2*I):
                     raise ValueError(f"gate_up_proj[{L}] {gu.shape} != (E,H,2I)=({E},{H},{2*I})")
-                nsd[f"layers.{L}.ffn.ffn.expert_mlps.mlp_op.gate_up_proj.weight"] = to_target(gu)
+                nsd[f"layers.{L}.ffn.expert_mlps.mlp_op.gate_up_proj.weight"] = to_target(gu)
 
             gub = take(f"model.layers.{L}.mlp.experts.gate_up_proj_bias", None)
             if gub is not None:
                 if gub.shape != (E, 2*I):
                     raise ValueError(f"gate_up_proj_bias[{L}] {gub.shape} != (E,2I)=({E},{2*I})")
-                nsd[f"layers.{L}.ffn.ffn.expert_mlps.mlp_op.gate_up_proj.bias"] = to_target(gub)
+                nsd[f"layers.{L}.ffn.expert_mlps.mlp_op.gate_up_proj.bias"] = to_target(gub)
 
             dp = take(f"model.layers.{L}.mlp.experts.down_proj", None)
             if dp is not None:
@@ -174,13 +174,13 @@ def convert_gptoss_to_neuron_state_dict(
                     dp = dp.transpose(1, 2).contiguous()  # -> [E, I, H]
                 if dp.shape != (E, I, H):
                     raise ValueError(f"down_proj[{L}] {dp.shape} != (E,I,H)=({E},{I},{H})")
-                nsd[f"layers.{L}.ffn.ffn.expert_mlps.mlp_op.down_proj.weight"] = to_target(dp)
+                nsd[f"layers.{L}.ffn.expert_mlps.mlp_op.down_proj.weight"] = to_target(dp)
 
             dpb = take(f"model.layers.{L}.mlp.experts.down_proj_bias", None)
             if dpb is not None:
                 if dpb.shape != (E, H):
                     raise ValueError(f"down_proj_bias[{L}] {dpb.shape} != (E,H)=({E},{H})")
-                nsd[f"layers.{L}.ffn.ffn.expert_mlps.mlp_op.down_proj.bias"] = to_target(dpb)
+                nsd[f"layers.{L}.ffn.expert_mlps.mlp_op.down_proj.bias"] = to_target(dpb)
 
             # ===== Norms 
             iln = take(f"model.layers.{L}.input_layernorm.weight", None)
