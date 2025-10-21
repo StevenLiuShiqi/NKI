@@ -15,7 +15,10 @@ from torch import nn
 from dataclasses import dataclass
 from transformers import AutoModelForCausalLM
 
-from neuronx_distributed_inference.modules.moe import initialize_moe_module
+from moe_classes import NeuronGPTOSSExpertMLPs
+
+from neuronx_distributed.modules.moe.routing import RouterTopK
+from neuronx_distributed.modules.rms_norm import RMSNorm
 
 from neuronx_distributed_inference.models.config import InferenceConfig, MoENeuronConfig
 from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
@@ -215,21 +218,67 @@ class GPTOSSInferenceConfig(InferenceConfig):
     def get_neuron_config_cls(cls):
         return NeuronGPTOSSConfig
     
-class NeuronMLPBlock(torch.nn.Module):
-    def __init__(self, config: InferenceConfig):
+class NeuronGPTOSSMLPBlock(torch.nn.Module):
+    def __init__(
+        self,
+        config,
+        device: torch.device | None = None,
+        weight_init_value: float | None = None,
+    ):
         super().__init__()
+        self.num_experts = config.num_local_experts
+        self.experts_per_token = config.num_experts_per_tok
+        # self.swiglu_limit = config.swiglu_limit
+        self.world_size = 1
         
-        self.ffn = initialize_moe_module(
-            config=config,
+        # RMSNorm
+        self.norm = RMSNorm(config.hidden_size, device=device)
+        
+        # Create Router (replaces self.gate)
+        self.router = RouterTopK(
+            num_experts=config.num_local_experts,
+            top_k=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            act_fn="softmax",  # matches your softmax
+            dtype=torch.bfloat16,
+            device=device,
+            # bias=False, 
+            sequence_parallel_enabled=False,  # adjust based on your setup
+        )
+        
+        # Create ExpertMLPs (replaces manual mlp1/mlp2 weights)
+        self.expert_mlps = NeuronGPTOSSExpertMLPs(
             num_experts=config.num_local_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
-            hidden_act="silu",
+            hidden_act="silu",  # SwiGLU uses SiLU internally
+            glu_mlp=True,  # SwiGLU is a GLU variant
+            # glu_type=GLUType.SWIGLU,  # specify SwiGLU
+            capacity_factor=None,  # full capacity (no dropping)
+            normalize_top_k_affinities=True,  # your softmax normalizes
+            # bias=False,  # as you mentioned
+            dtype=torch.bfloat16,
+            device=device,
+            tensor_model_parallel_group=None,  # set if using TP
+            # sequence_parallel_enabled=False,
         )
-    
-    def forward(self, x):
-        return self.ffn(x)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Original: x → norm → gate → topk → expert_mlps → weighted_sum → x + residual
+        # With MoE blocks: x → MoE (does all of the above) → x + residual
+
+        t = self.norm(x)
+        _, expert_affinities, expert_index = self.router(t)
+        seq_len = x.shape[1]
+        moe_output = self.expert_mlps(
+            hidden_states=t,
+            expert_affinities=expert_affinities,
+            expert_index=expert_index,
+            seq_len=seq_len
+        )
+        moe_output = moe_output.view_as(x)
+        return moe_output
 
 
 class NeuronGPTOSSAttentionBlock(NeuronAttentionBase):
@@ -261,7 +310,7 @@ class NeuronGPTOSSBlock(nn.Module):
         self.block_idx = block_idx
         
         self.self_attn = NeuronGPTOSSAttentionBlock(config=config)
-        self.ffn = NeuronMLPBlock(config=config)
+        self.ffn = NeuronGPTOSSMLPBlock(config=config)
         
         # RMS Norm
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
