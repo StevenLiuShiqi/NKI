@@ -12,6 +12,7 @@ from model import (
     # NeuronMLPBlock,
 )
 from gpt_oss import MLPBlock, ModelConfig
+from moe_classes import NeuronMLPBlock
 
 from neuronx_distributed_inference.utils.testing import build_module, validate_accuracy
 from neuronx_distributed.modules.moe.expert_mlps import ExpertMLPs
@@ -22,7 +23,7 @@ from neuronx_distributed.modules.rms_norm import RMSNorm
 _ARTIFACTS_DIR = Path(__file__).resolve().parent / "artifacts"
 _ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 _CHECKPOINT_PATH = _ARTIFACTS_DIR / "neuron_mlp_checkpoint.pt"
-_CONSTANT_INIT_VALUE = 0.1
+_CONSTANT_INIT_VALUE = 0.5
 
 
 def _fill_module_parameters(module: torch.nn.Module, value: float = _CONSTANT_INIT_VALUE) -> None:
@@ -58,87 +59,6 @@ def _make_tiny_inference_config():
         num_experts=4,
     )
 
-# Working MoE Block
-class NeuronMLPBlock(torch.nn.Module):
-    def __init__(
-        self,
-        config,
-        device: torch.device | None = None,
-        weight_init_value: float | None = None,
-    ):
-        super().__init__()
-        self.num_experts = config.num_local_experts
-        self.experts_per_token = config.num_experts_per_tok
-        # self.swiglu_limit = config.swiglu_limit
-        self.world_size = 1
-        
-        # RMSNorm (kept as is)
-        self.norm = RMSNorm(config.hidden_size, device=device)
-        
-        # Create Router (replaces self.gate)
-        self.router = RouterTopK(
-            num_experts=config.num_local_experts,
-            top_k=config.num_experts_per_tok,
-            hidden_size=config.hidden_size,
-            act_fn="softmax",  # matches your softmax
-            dtype=torch.bfloat16,
-            device=device,
-            # bias=False, 
-            sequence_parallel_enabled=False,  # adjust based on your setup
-        )
-        
-        # Create ExpertMLPs (replaces manual mlp1/mlp2 weights)
-        self.expert_mlps = ExpertMLPs(
-            num_experts=config.num_local_experts,
-            top_k=config.num_experts_per_tok,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            hidden_act="silu",  # SwiGLU uses SiLU internally
-            glu_mlp=True,  # SwiGLU is a GLU variant
-            # glu_type=GLUType.SWIGLU,  # specify SwiGLU
-            capacity_factor=None,  # full capacity (no dropping)
-            normalize_top_k_affinities=True,  # your softmax normalizes
-            # bias=False,  # as you mentioned
-            dtype=torch.bfloat16,
-            device=device,
-            tensor_model_parallel_group=None,  # set if using TP
-            # sequence_parallel_enabled=False,
-        )
-        
-        # Create complete MoE layer
-        # self.moe = MoE(
-        #     router=self.router,
-        #     expert_mlps=self.expert_mlps,
-        #     # rmsnorm=self.norm,  # can pass norm to MoE
-        #     sequence_parallel_enabled=False,
-        #     return_router_logits=False,  # set True if you need them
-        #     return_expert_index=False,   # set True if you need them
-        # )
-        if weight_init_value is not None:
-            _fill_module_parameters(self, weight_init_value)
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Original: x → norm → gate → topk → expert_mlps → weighted_sum → x + residual
-        # With MoE blocks: x → MoE (does all of the above) → x + residual
-        
-        # Option 1: Use MoE layer directly (it handles norm, routing, experts)
-        # moe_output = self.moe(x)
-        # return moe_output
-        
-        # Option 2: Manual control (closer to your original)
-        # If you want to separate norm from MoE:
-        t = self.norm(x)
-        router_logits, expert_affinities, expert_index = self.router(t)
-        # t_flat = t.view(-1, t.shape[-1])  # (B*S, H)
-        seq_len = x.shape[1]
-        moe_output = self.expert_mlps(
-            hidden_states=t,
-            expert_affinities=expert_affinities,
-            expert_index=expert_index,
-            seq_len=seq_len
-        )
-        moe_output = moe_output.view_as(x)
-        return moe_output
 
 def test_validate_accuracy_basic_module():
     config = _make_tiny_inference_config()
