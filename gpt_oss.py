@@ -335,7 +335,7 @@ class MLPBlock(torch.nn.Module):
         # MLP #1
         mlp1_weight = self.mlp1_weight[expert_indices, ...]
         mlp1_bias = self.mlp1_bias[expert_indices, ...]
-        t = torch.einsum("beck,bk->bec", mlp1_weight, t) # + mlp1_bias
+        t = torch.einsum("beck,bk->bec", mlp1_weight, t) + mlp1_bias
         t = swiglu(t, limit=self.swiglu_limit)
 
         # MLP #2
@@ -344,7 +344,7 @@ class MLPBlock(torch.nn.Module):
         t = torch.einsum("beck,bek->bec", mlp2_weight, t)
         if self.world_size > 1:
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
-        # t += mlp2_bias
+        t += mlp2_bias
 
         # Weighted sum of experts
         t = torch.einsum("bec,be->bc", t, expert_weights)
