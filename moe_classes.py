@@ -1,4 +1,5 @@
 from typing import Union, Optional, Callable, Any
+import math
 
 import torch 
 from torch import Tensor
@@ -15,6 +16,19 @@ from neuronx_distributed.modules.moe.moe_configs import RoutedExpertsMLPOpsConfi
 
 from neuronx_distributed.modules.moe.experts import Experts
 from neuronx_distributed.modules.moe.expert_mlps_v2 import ExpertMLPsV2
+
+from neuronx_distributed.modules.moe.moe_parallel_layers import (
+    ExpertFusedLinear,
+    ExpertFusedLinearWithAsyncCommunication,
+)
+
+from neuronx_distributed.parallel_layers.parallel_state import (
+    get_expert_model_parallel_size,
+    get_tensor_model_parallel_group,
+)
+
+from neuronx_distributed.parallel_layers import layers, mappings, parallel_state, utils
+
 
 _CONSTANT_INIT_VALUE = 0.5
 
@@ -33,6 +47,198 @@ def neuron_gptoss_swiglu(x,  alpha: float = 1.702, limit: float = 7.0):
     out_glu = x_glu * torch.sigmoid(alpha * x_glu)
     # Note we add an extra bias of 1 to the linear layer
     return out_glu * (x_linear + 1)
+
+class NeuronGPTOSSExpertFusedColumnParallelLinear(layers.ColumnParallelLinear, ExpertFusedLinear):
+
+    autograd_func_class = ExpertFusedLinearWithAsyncCommunication
+
+    def __init__(
+            self,
+            num_experts: int,
+            input_size: int,
+            output_size: int,
+            dtype: torch.dtype = torch.float32,
+            device: Optional[torch.device] = None,
+            stride: int = 1,
+            init_method: Optional[Callable[..., Any]] = None,
+            keep_master_weight: bool = False,
+            tensor_model_parallel_group: Optional[ProcessGroup] = None,
+        ) -> None:
+            self.num_experts = num_experts
+            self._n_local_experts = utils.divide(num_experts, parallel_state.get_expert_model_parallel_size())
+
+            super().__init__(
+                input_size=input_size,
+                output_size=output_size,
+                bias=True,
+                gather_output=False,
+                dtype=dtype,
+                device=device,
+                stride=stride,
+                init_method=init_method,
+                sequence_parallel_enabled=False,
+                keep_master_weight=keep_master_weight,
+                skip_bias_add=False,
+                tensor_model_parallel_group=tensor_model_parallel_group,
+            )
+            self._mark_expert_parallel_weights()
+
+    def set_weight_and_bias_config(self):
+        # Define 3D weight tensor, one linear layer per expert
+        self.weight_shape = (
+            self._n_local_experts,
+            self.input_size,
+            self.output_size_per_partition,
+        )
+        # Column parallel partitioning for each expert
+        self.weight_partition_dim = 2
+        self.bias_shape = (
+            self._n_local_experts,
+            self.output_size_per_partition,
+        )
+
+    def _init_weight(self, weight):
+        # Initialize the linear layer of each expert separately
+        assert len(weight.shape) == 3
+        for e in range(weight.shape[0]):
+            if self.arg_init_method is None:
+                torch.nn.init.kaiming_uniform_(weight[e], a=math.sqrt(5))
+            else:
+                self.arg_init_method(weight[e])
+
+    def _init_bias(self) -> None:
+        bound = 1 / math.sqrt(self.input_size) if self.input_size > 0 else 0
+        torch.nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, input_: torch.Tensor, expert_indices: Optional[torch.Tensor] = None, *_: Any) -> torch.Tensor:
+        """If expert_indices is provided, then the computations are performed only on the specified experts.
+        Otherwise, the input is passed through all experts in the layer."""
+
+        if self.async_tensor_model_parallel_allreduce or self.sequence_parallel_enabled:
+            input_parallel = input_
+        else:
+            input_parallel = mappings.copy_to_tensor_model_parallel_region(
+                input_,
+                process_group=self.tensor_parallel_group,
+            )
+
+        # Matrix multiply.
+        weight = self.weight[expert_indices, :, :] if expert_indices is not None else self.weight
+        output = self._forward_impl(
+            input=input_parallel,
+            weight=weight,
+            bias=None,
+            async_grad_allreduce=self.async_tensor_model_parallel_allreduce,
+            sequence_parallel_enabled=self.sequence_parallel_enabled,
+            autograd_func_class=self.autograd_func_class,
+            process_group=self.tensor_parallel_group,
+        )
+        if self.bias is not None:
+            bias = self.bias[expert_indices, :] if expert_indices is not None else self.bias
+            # Reshape bias to broadcast across expert capacity dimensions
+            while bias.dim() < output.dim():
+                bias = bias.unsqueeze(1)
+            output = output + bias
+        return output
+
+
+class NeuronGPTOSSExpertFusedRowParallelLinear(layers.RowParallelLinear, ExpertFusedLinear):
+    """Row-parallel expert linear with per-expert bias support."""
+
+    autograd_func_class = ExpertFusedLinearWithAsyncCommunication
+
+    def __init__(
+        self,
+        num_experts: int,
+        input_size: int,
+        output_size: int,
+        reduce_output: bool = True,
+        dtype: torch.dtype = torch.float32,
+        device: Optional[torch.device] = None,
+        stride: int = 1,
+        init_method: Optional[Callable[..., Any]] = None,
+        keep_master_weight: bool = False,
+        tensor_model_parallel_group: Optional[ProcessGroup] = None,
+    ) -> None:
+        self.num_experts = num_experts
+        self._n_local_experts = utils.divide(num_experts, parallel_state.get_expert_model_parallel_size())
+
+        super().__init__(
+            input_size=input_size,
+            output_size=output_size,
+            bias=True,
+            input_is_parallel=True,
+            dtype=dtype,
+            device=device,
+            stride=stride,
+            init_method=init_method,
+            sequence_parallel_enabled=False,
+            keep_master_weight=keep_master_weight,
+            skip_bias_add=False,
+            reduce_output=reduce_output,
+            tensor_model_parallel_group=tensor_model_parallel_group,
+        )
+        self._mark_expert_parallel_weights()
+
+    def set_weight_and_bias_config(self):
+        # Define 3D weight tensor, one linear layer per expert
+        self.weight_shape = (
+            self._n_local_experts,
+            self.input_size_per_partition,
+            self.output_size,
+        )
+        # Row parallel partitioning for each expert
+        self.weight_partition_dim = 1
+        self.bias_shape = (
+            self._n_local_experts,
+            self.output_size,
+        )
+
+    def _init_weight(self, weight):
+        # Initialize the linear layer of each expert separately
+        assert len(weight.shape) == 3
+        for e in range(weight.shape[0]):
+            if self.arg_init_method is None:
+                torch.nn.init.kaiming_uniform_(weight[e], a=math.sqrt(5))
+            else:
+                self.arg_init_method(weight[e])
+
+    def forward(self, input_: torch.Tensor, expert_indices: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """If expert_indices is provided, only compute the specified experts."""
+
+        weight = self.weight[expert_indices, :, :] if expert_indices is not None else self.weight
+        output_parallel = self._forward_impl(
+            input=input_,
+            weight=weight,
+            bias=None,
+            async_grad_allreduce=False,
+            sequence_parallel_enabled=False,
+            autograd_func_class=self.autograd_func_class,
+            process_group=self.tensor_parallel_group,
+        )
+
+        bias: Optional[torch.Tensor]
+        if self.bias is not None:
+            bias = self.bias[expert_indices, :] if expert_indices is not None else self.bias
+            while bias.dim() < output_parallel.dim():
+                bias = bias.unsqueeze(1)
+        else:
+            bias = None
+
+        if self.reduce_output:
+            output = mappings.reduce_from_tensor_model_parallel_region(
+                output_parallel, process_group=self.tensor_parallel_group,
+            )
+            if bias is not None:
+                # After reduce, output shape matches bias broadcast (experts, ..., hidden)
+                while bias.dim() < output.dim():
+                    bias = bias.unsqueeze(1)
+                output = output + bias
+            return output
+        else:
+            if bias is not None:
+                output_parallel = output_parallel + bias
+            return output_parallel
 
 class NeuronGPTOSSExperts(Experts):
     def __init__(
@@ -59,6 +265,54 @@ class NeuronGPTOSSExperts(Experts):
             input_layer_init_method=input_layer_init_method,
             output_layer_init_method=output_layer_init_method,
             tensor_model_parallel_group=tensor_model_parallel_group
+        )
+        
+        self._glu = glu
+        self._activation_fn = activation_fn
+        self.num_experts = num_experts
+        # todo: we can also generalize expert-parallel group
+        self.tensor_parallel_group = tensor_model_parallel_group if \
+            tensor_model_parallel_group is not None else get_tensor_model_parallel_group()
+
+        if self._glu:
+            self.gate_up_proj = NeuronGPTOSSExpertFusedColumnParallelLinear(
+                # we pass the global number of experts. the linear layer will itself
+                # decide to initialize a subset of them if EP is applied.
+                num_experts=num_experts,
+                input_size=hidden_size,
+                # we fuse up and gate projections to a single matmul. Later on in code
+                # we'll split the resulting output to yield up and gate matrices.
+                output_size=intermediate_size * 2,
+                dtype=dtype,
+                device=device,
+                stride=2,
+                init_method=input_layer_init_method,
+                tensor_model_parallel_group=self.tensor_parallel_group,
+            )
+        else:
+            self.up_proj = NeuronGPTOSSExpertFusedColumnParallelLinear(
+                # we pass the global number of experts. the linear layer will itself
+                # decide to initialize a subset of them if EP is applied.
+                num_experts=num_experts,
+                input_size=hidden_size,
+                output_size=intermediate_size,
+                dtype=dtype,
+                device=device,
+                init_method=input_layer_init_method,
+                tensor_model_parallel_group=self.tensor_parallel_group,
+            )
+
+        self.down_proj = NeuronGPTOSSExpertFusedRowParallelLinear(
+            # we pass the global number of experts. the linear layer will itself
+            # decide to initialize a subset of them if EP is applied.
+            num_experts=num_experts,
+            input_size=intermediate_size,
+            output_size=hidden_size,
+            reduce_output=get_expert_model_parallel_size() > 1,
+            dtype=dtype,
+            device=device,
+            init_method=output_layer_init_method,
+            tensor_model_parallel_group=self.tensor_parallel_group,
         )
     
     def _activation(self, x: Tensor) -> Tensor:
