@@ -19,6 +19,8 @@ from neuronx_distributed.modules.moe.expert_mlps_v2 import ExpertMLPsV2
 
 from neuronx_distributed.modules.moe.moe_parallel_layers import (
     ExpertFusedLinear,
+    ExpertFusedRowParallelLinear,
+    ExpertFusedColumnParallelLinear,
     ExpertFusedLinearWithAsyncCommunication,
 )
 
@@ -96,6 +98,8 @@ class NeuronGPTOSSExpertFusedColumnParallelLinear(layers.ColumnParallelLinear, E
             self._n_local_experts,
             self.output_size_per_partition,
         )
+        # Bias follows the column-partitioned output dimension
+        self.bias_partition_dim = 1
 
     def _init_weight(self, weight):
         # Initialize the linear layer of each expert separately
