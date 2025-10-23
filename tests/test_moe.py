@@ -31,7 +31,6 @@ def _fill_module_parameters(module: torch.nn.Module, value: float = _CONSTANT_IN
         for parameter in module.parameters():
             parameter.fill_(value)
 
-
 def _make_tiny_inference_config():
     neuron_config = NeuronGPTOSSConfig(
         batch_size=2,
@@ -57,6 +56,34 @@ def _make_tiny_inference_config():
         pad_token_id=0,
         rope_theta=10000.0,
         num_experts=4,
+    )
+
+def _make_original_inference_config():
+    # Match the released GPT-OSS 20B configuration.
+    neuron_config = NeuronGPTOSSConfig(
+        batch_size=1,
+        seq_len=4096,
+        tp_degree=8,
+        torch_dtype=torch.bfloat16,
+        capacity_factor=None,
+    )
+    return GPTOSSInferenceConfig(
+        neuron_config=neuron_config,
+        hidden_size=2880,
+        intermediate_size=2880,
+        num_local_experts=32,
+        num_experts_per_tok=4,
+        num_attention_heads=64,
+        num_key_value_heads=8,
+        head_dim=64,
+        vocab_size=201088,
+        max_position_embeddings=131072,
+        num_hidden_layers=24,
+        rms_norm_eps=1e-5,
+        pad_token_id=199999,
+        rope_theta=150000.0,
+        sliding_window=128,
+        num_experts=32,
     )
 
 
@@ -93,6 +120,7 @@ def test_validate_accuracy_basic_module():
     neuron_model = build_module(
         NeuronMLPBlock,
         example_inputs,
+        tp_degree=8,
         module_init_kwargs={
             "config": config,
             "weight_init_value": _CONSTANT_INIT_VALUE,
