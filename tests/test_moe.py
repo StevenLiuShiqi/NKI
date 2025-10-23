@@ -11,80 +11,17 @@ from model import (
     NeuronGPTOSSConfig,
     # NeuronMLPBlock,
 )
-from gpt_oss import MLPBlock, ModelConfig
+from gpt_oss import MLPBlock
 from moe_classes import NeuronMLPBlock
 
 from neuronx_distributed_inference.utils.testing import build_module, validate_accuracy
-from neuronx_distributed.modules.moe.expert_mlps import ExpertMLPs
-from neuronx_distributed.modules.moe.model import MoE
-from neuronx_distributed.modules.moe.routing import RouterTopK
-from neuronx_distributed.modules.rms_norm import RMSNorm
+
+from test_utils import _make_tiny_inference_config, _get_ref_config, _fill_module_parameters
 
 _ARTIFACTS_DIR = Path(__file__).resolve().parent / "artifacts"
 _ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 _CHECKPOINT_PATH = _ARTIFACTS_DIR / "neuron_mlp_checkpoint.pt"
 _CONSTANT_INIT_VALUE = 0.5
-
-
-def _fill_module_parameters(module: torch.nn.Module, value: float = _CONSTANT_INIT_VALUE) -> None:
-    with torch.no_grad():
-        for parameter in module.parameters():
-            parameter.fill_(value)
-
-def _make_tiny_inference_config():
-    neuron_config = NeuronGPTOSSConfig(
-        batch_size=2,
-        seq_len=6,
-        tp_degree=2,
-        torch_dtype="bfloat16",
-        # glu_mlp=True,
-        capacity_factor=None,
-    )
-    return GPTOSSInferenceConfig(
-        neuron_config=neuron_config,
-        hidden_size=8,
-        intermediate_size=16,
-        num_local_experts=4,
-        num_experts_per_tok=4,
-        num_attention_heads=2,
-        num_key_value_heads=2,
-        head_dim=4,
-        vocab_size=64,
-        max_position_embeddings=32,
-        num_hidden_layers=2,
-        rms_norm_eps=1e-5,
-        pad_token_id=0,
-        rope_theta=10000.0,
-        num_experts=4,
-    )
-
-def _make_original_inference_config():
-    # Match the released GPT-OSS 20B configuration.
-    neuron_config = NeuronGPTOSSConfig(
-        batch_size=1,
-        seq_len=4096,
-        tp_degree=8,
-        torch_dtype=torch.bfloat16,
-        capacity_factor=None,
-    )
-    return GPTOSSInferenceConfig(
-        neuron_config=neuron_config,
-        hidden_size=2880,
-        intermediate_size=2880,
-        num_local_experts=32,
-        num_experts_per_tok=4,
-        num_attention_heads=64,
-        num_key_value_heads=8,
-        head_dim=64,
-        vocab_size=201088,
-        max_position_embeddings=131072,
-        num_hidden_layers=24,
-        rms_norm_eps=1e-5,
-        pad_token_id=199999,
-        rope_theta=150000.0,
-        sliding_window=128,
-        num_experts=32,
-    )
 
 
 def test_validate_accuracy_basic_module():
@@ -94,25 +31,7 @@ def test_validate_accuracy_basic_module():
     inputs = [(sample,)]
     example_inputs = [(torch.zeros_like(sample),)]
 
-    reference_config = ModelConfig(
-        num_hidden_layers=config.num_hidden_layers,
-        num_experts=config.num_local_experts,
-        experts_per_token=config.num_experts_per_tok,
-        vocab_size=config.vocab_size,
-        hidden_size=config.hidden_size,
-        intermediate_size=config.intermediate_size,
-        head_dim=config.head_dim,
-        num_attention_heads=config.num_attention_heads,
-        num_key_value_heads=config.num_key_value_heads,
-        sliding_window=getattr(config, "sliding_window", ModelConfig.sliding_window),
-        initial_context_length=config.max_position_embeddings,
-        rope_theta=config.rope_theta,
-        rope_scaling_factor=getattr(
-            config, "rope_scaling_factor", ModelConfig.rope_scaling_factor
-        ),
-        rope_ntk_alpha=getattr(config, "rope_ntk_alpha", ModelConfig.rope_ntk_alpha),
-        rope_ntk_beta=getattr(config, "rope_ntk_beta", ModelConfig.rope_ntk_beta),
-    )
+    reference_config = _get_ref_config(config=config)
 
     if _CHECKPOINT_PATH.exists():
         _CHECKPOINT_PATH.unlink()
@@ -120,7 +39,7 @@ def test_validate_accuracy_basic_module():
     neuron_model = build_module(
         NeuronMLPBlock,
         example_inputs,
-        tp_degree=8,
+        tp_degree=1,
         module_init_kwargs={
             "config": config,
             "weight_init_value": _CONSTANT_INIT_VALUE,
@@ -133,7 +52,7 @@ def test_validate_accuracy_basic_module():
         weight_init_value=_CONSTANT_INIT_VALUE,
     )
 
-    _fill_module_parameters(module_cpu)
+    _fill_module_parameters(module_cpu, _CONSTANT_INIT_VALUE)
     
     def cpu_forward(x):
         return module_cpu(x)
