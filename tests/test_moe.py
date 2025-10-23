@@ -36,7 +36,7 @@ def _make_tiny_inference_config():
     neuron_config = NeuronGPTOSSConfig(
         batch_size=2,
         seq_len=6,
-        tp_degree=1,
+        tp_degree=2,
         torch_dtype="bfloat16",
         # glu_mlp=True,
         capacity_factor=None,

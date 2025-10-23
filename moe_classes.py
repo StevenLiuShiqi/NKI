@@ -23,8 +23,8 @@ from neuronx_distributed.modules.moe.moe_parallel_layers import (
 )
 
 from neuronx_distributed.parallel_layers.parallel_state import (
-    get_expert_model_parallel_size,
     get_tensor_model_parallel_group,
+    get_tensor_model_parallel_size,
 )
 
 from neuronx_distributed.parallel_layers import layers, mappings, parallel_state, utils
@@ -215,30 +215,18 @@ class NeuronGPTOSSExpertFusedRowParallelLinear(layers.RowParallelLinear, ExpertF
             sequence_parallel_enabled=False,
             autograd_func_class=self.autograd_func_class,
             process_group=self.tensor_parallel_group,
+            reduce_dtype=self.reduce_dtype,
         )
 
-        bias: Optional[torch.Tensor]
+        output = self._rpl_maybe_reduce_output(output_parallel)
+
         if self.bias is not None:
             bias = self.bias[expert_indices, :] if expert_indices is not None else self.bias
-            while bias.dim() < output_parallel.dim():
+            while bias.dim() < output.dim():
                 bias = bias.unsqueeze(1)
-        else:
-            bias = None
+            output = output + bias
 
-        if self.reduce_output:
-            output = mappings.reduce_from_tensor_model_parallel_region(
-                output_parallel, process_group=self.tensor_parallel_group,
-            )
-            if bias is not None:
-                # After reduce, output shape matches bias broadcast (experts, ..., hidden)
-                while bias.dim() < output.dim():
-                    bias = bias.unsqueeze(1)
-                output = output + bias
-            return output
-        else:
-            if bias is not None:
-                output_parallel = output_parallel + bias
-            return output_parallel
+        return output
 
 class NeuronGPTOSSExperts(Experts):
     def __init__(
@@ -308,7 +296,7 @@ class NeuronGPTOSSExperts(Experts):
             num_experts=num_experts,
             input_size=intermediate_size,
             output_size=hidden_size,
-            reduce_output=get_expert_model_parallel_size() > 1,
+            reduce_output=get_tensor_model_parallel_size() > 1,
             dtype=dtype,
             device=device,
             init_method=output_layer_init_method,
