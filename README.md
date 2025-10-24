@@ -31,8 +31,20 @@ Update Transformers:
 pip install --upgrade transformers
 ```
 
+Ignore this error message:
+
+```
+ERROR: pip's dependency resolver does not currently take into account all the packages that are installed. This behaviour is the source of the following dependency conflicts.
+neuronx-distributed-inference 0.6.10598+a59fdc00 requires transformers==4.51.*, but you have transformers 4.57.1 which is incompatible.
+```
+
 Run main.py:
 
 ```Shell
 python main.py
 ```
+
+Notes:
+
+- The first time you run this script, `import torch` take an awfully long time (~5 minutes).
+- Compiling and saving the model takes ~5-6 minutes.

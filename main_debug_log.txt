@@ -15,3 +15,72 @@ GenerationConfig {
   ],
   "pad_token_id": 199999
 }
+
+
+```
+class NeuronGPTOSSForCausalLM(NeuronBaseForCausalLM):
+    """
+    This class can be used as GPTOSSForCausalLM
+    """
+    _STATE_DICT_MODEL_PREFIX = "transformer."
+    _model_cls = NeuronGPTOSSModel
+
+    @staticmethod
+    def load_hf_model(model_path, **kwargs):
+        import pdb; pdb.set_trace()
+        return AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
+
+    @staticmethod
+    def convert_hf_to_neuron_state_dict(state_dict: dict, config: InferenceConfig) -> dict:
+        import pdb; pdb.set_trace()
+        print(f"STATE DICT: {state_dict.keys()}")
+        return convert_gptoss_to_neuron_state_dict(state_dict, config)
+
+    @classmethod
+    def get_config_cls(cls):
+        import pdb; pdb.set_trace()
+        return GPTOSSInferenceConfig
+
+    def get_compiler_args(self):
+        import pdb; pdb.set_trace()
+        return
+
+> /home/ubuntu/NKI/main.py(901)get_compiler_args()
+-> return
+(Pdb) p
+*** SyntaxError: invalid syntax
+(Pdb) u
+> /opt/aws_neuronx_venv_pytorch_2_8_nxd_inference/lib/python3.10/site-packages/neuronx_distributed_inference/models/model_base.py(2981)enable_context_encoding()
+-> compiler_args=self.get_compiler_args(),
+(Pdb) u
+> /opt/aws_neuronx_venv_pytorch_2_8_nxd_inference/lib/python3.10/site-packages/neuronx_distributed_inference/models/model_base.py(2896)__init__()
+-> self.enable_context_encoding()
+(Pdb) u
+> /home/ubuntu/NKI/main.py(967)<module>()
+-> model = NeuronGPTOSSForCausalLM(model_path, config)
+(Pdb) u
+*** Oldest frame
+
+> /home/ubuntu/NKI/main.py(891)convert_hf_to_neuron_state_dict()
+-> print(f"STATE DICT: {state_dict.keys()}")
+(Pdb) u
+> /opt/aws_neuronx_venv_pytorch_2_8_nxd_inference/lib/python3.10/site-packages/neuronx_distributed_inference/models/application_base.py(616)get_state_dict()
+-> model_sd = cls.convert_hf_to_neuron_state_dict(model_sd, config)
+(Pdb) u
+> /opt/aws_neuronx_venv_pytorch_2_8_nxd_inference/lib/python3.10/site-packages/neuronx_distributed_inference/models/application_base.py(568)checkpoint_loader_fn()
+-> model_sd = self.get_state_dict(model_path, self.config)
+(Pdb) u
+> /opt/aws_neuronx_venv_pytorch_2_8_nxd_inference/lib/python3.10/site-packages/neuronx_distributed/trace/model_builder.py(1687)shard_checkpoint()
+-> checkpoint = self.checkpoint_loader()
+(Pdb) u
+> /opt/aws_neuronx_venv_pytorch_2_8_nxd_inference/lib/python3.10/site-packages/neuronx_distributed_inference/models/application_base.py(371)load_weights()
+-> weights = self.get_builder().shard_checkpoint()
+(Pdb) u
+> /opt/aws_neuronx_venv_pytorch_2_8_nxd_inference/lib/python3.10/site-packages/neuronx_distributed_inference/models/application_base.py(298)load()
+-> self.load_weights(
+(Pdb) u
+> /home/ubuntu/NKI/main.py(982)<module>()
+-> model.load(compiled_model_path)
+(Pdb) u
+*** Oldest frame
+```
