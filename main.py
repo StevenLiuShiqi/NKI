@@ -44,6 +44,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 _CONSTANT_INIT_VALUE = 0.5
 
 
+def inspect(self, tensor):
+    tensor_list = tensor.tolist()
+    with open(str(time.time()) + '.json', 'w') as f:
+        json.dump({'tensor': tensor_list, 'dtype': str(tensor.device), 'class': self.__class__.__name__}, f)
+
+
 def _fill_module_parameters(module: torch.nn.Module, value: float = _CONSTANT_INIT_VALUE) -> None:
     with torch.no_grad():
         for parameter in module.parameters():
@@ -125,7 +131,8 @@ class NeuronGPTOSSExpertFusedColumnParallelLinear(layers.ColumnParallelLinear, E
         bound = 1 / math.sqrt(self.input_size) if self.input_size > 0 else 0
         torch.nn.init.uniform_(self.bias, -bound, bound)
 
-    def forward(self, input_: torch.Tensor, expert_indices: Optional[torch.Tensor] = None, *_: Any) -> torch.Tensor:
+    def forward(self, input_: torch.Tensor, expert_indices: Optional[torch.Tensor] = None, *_: Any) -> torch.Tensor
+        inspect(self, input_)
         """If expert_indices is provided, then the computations are performed only on the specified experts.
         Otherwise, the input is passed through all experts in the layer."""
 
@@ -220,6 +227,7 @@ class NeuronGPTOSSExpertFusedRowParallelLinear(layers.RowParallelLinear, ExpertF
 
     def forward(self, input_: torch.Tensor, expert_indices: Optional[torch.Tensor] = None) -> torch.Tensor:
         """If expert_indices is provided, only compute the specified experts."""
+        inspect(self, input_)
 
         weight = self.weight[expert_indices, :, :] if expert_indices is not None else self.weight
         output_parallel = self._forward_impl(
@@ -492,6 +500,7 @@ class NeuronMLPBlock(torch.nn.Module):
             _fill_module_parameters(self, weight_init_value)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        inspect(self, x)
         # Original: x → norm → gate → topk → expert_mlps → weighted_sum → x + residual
         # With MoE blocks: x → MoE (does all of the above) → x + residual
 
@@ -749,6 +758,7 @@ class NeuronGPTOSSMLPBlock(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Original: x → norm → gate → topk → expert_mlps → weighted_sum → x + residual
         # With MoE blocks: x → MoE (does all of the above) → x + residual
+        inspect(self, x)
 
         t = x
         _, expert_affinities, expert_index = self.router(t)
@@ -808,6 +818,7 @@ class NeuronGPTOSSBlock(nn.Module):
             past_key_value: Optional[Tuple[torch.Tensor]] = None,
             **kwargs,
     ):
+        inspect(self, hidden_states)
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states).to(dtype=hidden_states.dtype)
 
