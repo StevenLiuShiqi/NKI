@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from model import NeuronGPTOSSAttentionBlock  # noqa: E402
+from model import NeuronGPTOSSBlock  # noqa: E402
 from gpt_oss import AttentionBlock, MLPBlock  # noqa: E402
 
 from neuronx_distributed_inference.utils.testing import build_module, validate_accuracy
@@ -22,10 +22,26 @@ _CONSTANT_INIT_VALUE = 0.5
 
 _ARTIFACTS_DIR = Path(__file__).resolve().parent / "artifacts"
 _ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
-_CHECKPOINT_PATH = _ARTIFACTS_DIR / "neuron_attention_checkpoint.pt"
+_CHECKPOINT_PATH = _ARTIFACTS_DIR / "neuron_decoder_checkpoint.pt"
 _CONSTANT_INIT_VALUE = 0.5
 
-def test_attention_block_forward_matches_reference():
+class _ReferenceDecoderBlock(torch.nn.Module):
+    def __init__(self, config, layer_idx: int = 0):
+        super().__init__()
+        self.attention = AttentionBlock(config=config, layer_idx=layer_idx)
+        self.mlp = MLPBlock(config=config)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        original_shape = hidden_states.shape
+        tokens = hidden_states.view(-1, original_shape[-1])
+        attn_output = self.attention(tokens)
+        mlp_input = attn_output
+        mlp_output = self.mlp(mlp_input)
+        combined = mlp_input + mlp_output
+        return combined.view(original_shape)
+
+
+def test_decoder_block_forward_matches_reference():
     config = _make_tiny_inference_config()
     reference_config = _get_ref_config(config=config)
 
@@ -45,26 +61,28 @@ def test_attention_block_forward_matches_reference():
     inputs = [(sample, position_ids)]
     example_inputs = [(torch.zeros_like(sample), torch.zeros(batch_size, seq_len, dtype=torch.long))]
     
+    
     neuron_block = build_module(
-        NeuronGPTOSSAttentionBlock,
+        NeuronGPTOSSBlock,
         example_inputs,
         tp_degree=1,
         module_init_kwargs={
             "config": config,
+            "block_idx": 0,
         },
         checkpoint_path=str(_CHECKPOINT_PATH),
     )
 
-    reference_block = AttentionBlock(reference_config)
+    reference_block = _ReferenceDecoderBlock(reference_config, layer_idx=0)
 
     _fill_module_parameters(neuron_block, _CONSTANT_INIT_VALUE)
     _fill_module_parameters(reference_block, _CONSTANT_INIT_VALUE)
 
+
     with torch.no_grad():
-        flat_sample = sample.view(-1, hidden_size)
-        ref_tokens = reference_block(flat_sample)
-        reference_output = ref_tokens.view(batch_size, seq_len, hidden_size)
+        reference_output = reference_block(sample)
 
     validate_accuracy(neuron_block, inputs, expected_outputs=[reference_output])
 
-test_attention_block_forward_matches_reference()
+
+test_decoder_block_forward_matches_reference()
