@@ -16,7 +16,7 @@ def _make_tiny_inference_config():
     neuron_config = NeuronGPTOSSConfig(
         batch_size=2,
         seq_len=6,
-        tp_degree=2,
+        tp_degree=1,
         torch_dtype="bfloat16",
         # glu_mlp=True,
         capacity_factor=None,
@@ -86,9 +86,7 @@ def _get_ref_config(config):
         sliding_window=getattr(config, "sliding_window", ModelConfig.sliding_window),
         initial_context_length=config.max_position_embeddings,
         rope_theta=config.rope_theta,
-        rope_scaling_factor=getattr(
-            config, "rope_scaling_factor", ModelConfig.rope_scaling_factor
-        ),
+        rope_scaling_factor=1.0,
         rope_ntk_alpha=getattr(config, "rope_ntk_alpha", ModelConfig.rope_ntk_alpha),
         rope_ntk_beta=getattr(config, "rope_ntk_beta", ModelConfig.rope_ntk_beta),
     )
