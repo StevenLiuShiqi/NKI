@@ -215,7 +215,8 @@ class AttentionBlock(torch.nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        t = self.norm(x)
+        # t = self.norm(x)
+        t = x
         qkv = self.qkv(t)
         q = qkv[:, : self.num_attention_heads * self.head_dim].contiguous()
         k = qkv[
@@ -242,7 +243,7 @@ class AttentionBlock(torch.nn.Module):
         q, k = self.rope(q, k)
         t = sdpa(q, k, v, self.sinks, self.sm_scale, self.sliding_window)
         t = self.out(t)
-        t = x + t
+        # t = x + t
         return t
 
 

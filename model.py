@@ -234,7 +234,7 @@ class NeuronGPTOSSMLPBlock(torch.nn.Module):
         self.world_size = 1
         
         # RMSNorm
-        # self.norm = RMSNorm(config.hidden_size, device=device)
+        self.norm = RMSNorm(config.hidden_size, device=device)
         
         # Create Router (replaces self.gate)
         self.router = RouterTopK(
@@ -301,47 +301,48 @@ class NeuronGPTOSSAttentionBlock(NeuronAttentionBase):
             rotary_emb=rotary_emb,
             qkv_bias=True,     # <-- set to True if your checkpoint has q/k/v biases
             o_bias=True,
+            learned_sinks_size=1,  
         )
     
     # enable for testing
-    # def forward(
-    #     self,
-    #     hidden_states: torch.Tensor,
-    #     position_ids: torch.LongTensor,
-    #     attention_mask: Optional[torch.Tensor] = None,
-    #     past_key_value: Optional[Tuple[torch.Tensor]] = None,
-    #     active_mask: Optional[torch.LongTensor] = None,
-    #     adapter_ids=None,
-    #     cos_cache: Optional[torch.Tensor] = None,
-    #     sin_cache: Optional[torch.Tensor] = None,
-    #     rmsnorm=None,
-    #     rotary_position_ids: Optional[torch.LongTensor] = None,
-    #     # args for kv cache usage
-    #     kv_mgr: Optional[KVCacheManager] = None,
-    #     get_kv_per_layer: bool = False,
-    #     update_kv_per_layer: bool = False,
-    #     residual: Optional[torch.Tensor] = None,
-    #     **kwargs,
-    # ):
-    #     output = super().forward(
-    #         hidden_states=hidden_states,
-    #         position_ids=position_ids,
-    #         attention_mask=attention_mask,
-    #         past_key_value=past_key_value,
-    #         active_mask=active_mask,
-    #         adapter_ids=adapter_ids,
-    #         cos_cache=cos_cache,
-    #         sin_cache=sin_cache,
-    #         rmsnorm=rmsnorm,
-    #         rotary_position_ids=rotary_position_ids,
-    #         kv_mgr=kv_mgr,
-    #         get_kv_per_layer=get_kv_per_layer,
-    #         update_kv_per_layer=update_kv_per_layer,
-    #         residual=residual,
-    #         **kwargs,
-    #     )
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        active_mask: Optional[torch.LongTensor] = None,
+        adapter_ids=None,
+        cos_cache: Optional[torch.Tensor] = None,
+        sin_cache: Optional[torch.Tensor] = None,
+        rmsnorm=None,
+        rotary_position_ids: Optional[torch.LongTensor] = None,
+        # args for kv cache usage
+        kv_mgr: Optional[KVCacheManager] = None,
+        get_kv_per_layer: bool = False,
+        update_kv_per_layer: bool = False,
+        residual: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        output = super().forward(
+            hidden_states=hidden_states,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            past_key_value=past_key_value,
+            active_mask=active_mask,
+            adapter_ids=adapter_ids,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+            rmsnorm=rmsnorm,
+            rotary_position_ids=rotary_position_ids,
+            kv_mgr=kv_mgr,
+            get_kv_per_layer=get_kv_per_layer,
+            update_kv_per_layer=update_kv_per_layer,
+            residual=residual,
+            **kwargs,
+        )
         
-    #     return tuple(output)
+        return tuple(output)
 
 class NeuronGPTOSSBlock(nn.Module):
     def __init__(self, config: GPTOSSInferenceConfig, block_idx: int):
@@ -387,9 +388,7 @@ class NeuronGPTOSSBlock(nn.Module):
         hidden_states = self.ffn(hidden_states)[0] # not sure why indexing
         hidden_states = residual + hidden_states
         
-        # outputs = (hidden_states, present_key_value, cos_cache, sin_cache, None)
-        
-        outputs = hidden_states
+        outputs = (hidden_states, present_key_value, cos_cache, sin_cache, None)
         return outputs
     
 class NeuronGPTOSSModel(NeuronBaseModel):
