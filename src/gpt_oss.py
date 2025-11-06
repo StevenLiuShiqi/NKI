@@ -215,7 +215,7 @@ class AttentionBlock(torch.nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # t = self.norm(x)
+        t = self.norm(x)
         t = x
         qkv = self.qkv(t)
         q = qkv[:, : self.num_attention_heads * self.head_dim].contiguous()
