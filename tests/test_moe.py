@@ -6,13 +6,13 @@ import torch
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from model import (
+from src.model import (
     GPTOSSInferenceConfig,
     NeuronGPTOSSConfig,
     # NeuronMLPBlock,
 )
-from gpt_oss import MLPBlock
-from moe_classes import NeuronMLPBlock
+from src.gpt_oss import MLPBlock
+from src.moe_classes import NeuronMLPBlock
 
 from neuronx_distributed_inference.utils.testing import build_module, validate_accuracy
 

@@ -15,7 +15,7 @@ from torch import nn
 from dataclasses import dataclass
 from transformers import AutoModelForCausalLM
 
-from moe_classes import NeuronGPTOSSExpertMLPs
+from src.moe_classes import NeuronGPTOSSExpertMLPs
 
 from neuronx_distributed.modules.moe.routing import RouterTopK
 from neuronx_distributed.modules.rms_norm import RMSNorm
@@ -53,12 +53,12 @@ def convert_gptoss_to_neuron_state_dict(
     Emits keys:
       layers.{L}.self_attn.qkv_proj.{q_proj,k_proj,v_proj}.{weight,bias}
       layers.{L}.self_attn.o_proj.o_proj.{weight,bias}
+      layers.{L}.self_attn.learned_sinks.sink (if present)
+      layers.{L}.self_attn.tkg_learned_sinks.sink (if present)
       layers.{L}.ffn.router.linear_router.{weight,bias}
       layers.{L}.ffn.expert_mlps.mlp_op.{gate_up_proj,down_proj}.{weight,bias}
       layers.{L}.{input_layernorm,post_attention_layernorm}.weight
       embed_tokens.weight, norm.weight, lm_head.weight
-
-    Silently drops non-parameter buffers like self_attn.sinks.
     """
 
     def take(key, default=None, *, pop=inplace_pop):
@@ -136,9 +136,14 @@ def convert_gptoss_to_neuron_state_dict(
             if ob is not None:
                 nsd[f"layers.{L}.self_attn.o_proj.o_proj.bias"] = to_target(ob)
 
-            # Drop sinks buffer if present
-            _buf = take(f"model.layers.{L}.self_attn.sinks", None)
-            _buf = None
+            # ===== Attention sinks (learned sink tokens for sliding window attention)
+            # NeuronAttentionBase has two sink modules: learned_sinks (CTE) and tkg_learned_sinks (TKG)
+            # Both use the same source tensor from GPT-OSS model.layers.{L}.self_attn.sinks
+            sinks = take(f"model.layers.{L}.self_attn.sinks", None)
+            if sinks is not None:
+                # Map to both CTE and TKG sink parameters (shape: [num_attention_heads])
+                nsd[f"layers.{L}.self_attn.learned_sinks.sink"] = to_target(sinks)
+                nsd[f"layers.{L}.self_attn.tkg_learned_sinks.sink"] = to_target(sinks.clone())
 
             # ===== Router -> ffn.router.linear_router.{weight,bias}
             rw = take(f"model.layers.{L}.mlp.router.weight", None)
@@ -284,13 +289,16 @@ class NeuronGPTOSSMLPBlock(torch.nn.Module):
         return moe_output
 
 class NeuronGPTOSSAttentionBlock(NeuronAttentionBase):
-    def __init__(self, config: InferenceConfig):
+    def __init__(self, config: InferenceConfig, layer_idx: int = 0, weight_init_value: float = None):
         rotary_emb = RotaryEmbedding(
-            dim=config.head_dim,                                     # ← 64 (matches Q/K last dim)
-            max_position_embeddings=config.max_position_embeddings,  # 131072 from config
-            base=config.rope_theta,                                  # 150000 from config
+            dim=config.head_dim,
+            max_position_embeddings=config.max_position_embeddings,
+            base=config.rope_theta,
         )
-        
+
+        # Sliding window is applied to every other layer (even layer indices)
+        sliding_window = getattr(config, 'sliding_window', None) if layer_idx % 2 == 0 else None
+
         super().__init__(
             config=config,
             hidden_size=config.hidden_size,
@@ -299,12 +307,24 @@ class NeuronGPTOSSAttentionBlock(NeuronAttentionBase):
             num_key_value_heads=config.num_key_value_heads,
             rms_norm_eps=config.rms_norm_eps,
             rotary_emb=rotary_emb,
-            qkv_bias=True,     # <-- set to True if your checkpoint has q/k/v biases
+            qkv_bias=True,
             o_bias=True,
-            learned_sinks_size=1,  
+            learned_sinks_size=1,
+            sliding_window=sliding_window,
         )
-    
-    # enable for testing
+
+        self.layer_idx = layer_idx
+
+        # Initialize weights to constant value if specified (for testing)
+        if weight_init_value is not None:
+            self._initialize_weights(weight_init_value)
+
+    def _initialize_weights(self, value: float) -> None:
+        """Initialize all parameters to a constant value for deterministic testing."""
+        with torch.no_grad():
+            for param in self.parameters():
+                param.fill_(value)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -341,44 +361,9 @@ class NeuronGPTOSSAttentionBlock(NeuronAttentionBase):
             residual=residual,
             **kwargs,
         )
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_ids: torch.LongTensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        active_mask: Optional[torch.LongTensor] = None,
-        adapter_ids=None,
-        cos_cache: Optional[torch.Tensor] = None,
-        sin_cache: Optional[torch.Tensor] = None,
-        rmsnorm=None,
-        rotary_position_ids: Optional[torch.LongTensor] = None,
-        # args for kv cache usage
-        kv_mgr: Optional[KVCacheManager] = None,
-        get_kv_per_layer: bool = False,
-        update_kv_per_layer: bool = False,
-        residual: Optional[torch.Tensor] = None,
-        **kwargs,
-    ):
-        output = super().forward(
-            hidden_states=hidden_states,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            past_key_value=past_key_value,
-            active_mask=active_mask,
-            adapter_ids=adapter_ids,
-            cos_cache=cos_cache,
-            sin_cache=sin_cache,
-            rmsnorm=rmsnorm,
-            rotary_position_ids=rotary_position_ids,
-            kv_mgr=kv_mgr,
-            get_kv_per_layer=get_kv_per_layer,
-            update_kv_per_layer=update_kv_per_layer,
-            residual=residual,
-            **kwargs,
-        )
-        
-        return tuple(output)
+
+        # Return just the hidden states to match reference implementation
+        return tuple(output)[0]
 
 class NeuronGPTOSSBlock(nn.Module):
     def __init__(self, config: GPTOSSInferenceConfig, block_idx: int):

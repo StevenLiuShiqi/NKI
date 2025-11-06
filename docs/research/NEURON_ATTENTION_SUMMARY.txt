@@ -1,0 +1,296 @@
+================================================================================
+NEURON DISTRIBUTED INFERENCE ATTENTION MODULE - EXECUTIVE SUMMARY
+================================================================================
+
+LOCATION:
+/opt/aws_neuronx_venv_pytorch_2_8_nxd_inference/lib/python3.10/site-packages/neuronx_distributed_inference/modules/attention/
+
+KEY FILES:
+- attention_base.py (3000+ lines) - Main attention implementation
+- gqa.py (1000+ lines) - QKV/Output projections  
+- sink.py (45 lines) - Learned sink implementation
+- utils.py - Utility functions (RoPE, softmax, etc.)
+- attention_process_groups.py - Parallel group management
+
+================================================================================
+1. NEURONATTENTIONBASE CLASS STRUCTURE
+================================================================================
+
+CORE COMPONENTS:
+1. QKV Projection Layer (GroupQueryAttention_QKV)
+   - Fused variant: Combined Q, K, V projection
+   - Separated variant: Individual Q, K, V projections
+   - Both variants support optional bias (qkv_bias parameter)
+   - Uses ColumnParallelLinear for tensor parallelism
+
+2. Output Projection Layer (GroupQueryAttention_O)
+   - Row parallel linear layer
+   - Combines attention output and projects to hidden_size
+   - Optional bias control (o_bias parameter)
+
+3. Parallel Processing Groups
+   - Tensor Parallel (TP): Default across all stages
+   - Context Parallel (CP): Prefill stage optimization
+   - Data Parallel (DP): Decode stage optimization
+   - Stage-aware automatic routing
+
+4. Kernel Support
+   - Flash attention kernels (multiple variants)
+   - Token generation kernels (builtin and NKI)
+   - Chunked prefill kernels
+   - Sliding window attention kernels
+
+================================================================================
+2. LEARNED SINKS AND TKG LEARNED SINKS
+================================================================================
+
+PURPOSE:
+- Trainable parameters that capture excess attention probability
+- Improve attention distribution in token generation scenarios
+- Provide "sink" tokens for better convergence
+
+CONSTRAINTS:
+- learned_sinks_size must equal 1 (single sink token only)
+- Shape per rank: (num_attention_heads / tensor_model_parallel_size,)
+- Initialized as zeros, non-trainable by default
+
+INITIALIZATION:
+- self.learned_sinks: For context encoding stage (CTE)
+- self.tkg_learned_sinks: For token generation (TKG) stage
+- Created conditionally when learned_sinks_size parameter is provided
+
+USAGE PATTERN:
+1. Get learned sinks via get_learned_sinks() method
+2. Expand from (num_heads,) to (batch, num_heads, seqlen, 1)
+3. Concatenate with attention scores (attention_scores.shape[-1] + 1)
+4. Apply softmax across all tokens including sink
+5. Remove sink columns from final softmax output
+6. Result: only original sequence attention is used
+
+RETRIEVAL LOGIC:
+- Prefill stage with CP != DP: Uses self.learned_sinks
+- Token gen stage with CP != DP: Uses self.tkg_learned_sinks
+- All other configurations: Uses self.learned_sinks
+
+================================================================================
+3. FORWARD SIGNATURE AND RETURN VALUES
+================================================================================
+
+MAIN FORWARD METHOD:
+Location: attention_base.py lines 1846-1938
+
+INPUTS:
+- hidden_states: (batch, seq_len, hidden_size)
+- attention_mask: Optional causal/padding mask
+- position_ids: Token positions for RoPE
+- past_key_value: Cached KV from previous step (token gen)
+- active_mask: Current token attention mask
+- adapter_ids: For LoRA adapter support
+- cos_cache, sin_cache: Precomputed RoPE values
+- rmsnorm: Reference to RMSNorm layer
+- rotary_position_ids: RoPE position indices
+- kv_mgr: KV cache manager
+- get_kv_per_layer, update_kv_per_layer: Cache management flags
+- residual: Residual tensor for residual connections
+- **kwargs: Additional configuration parameters
+
+RETURN TYPE: NeuronAttentionBaseOutput (dataclass)
+
+RETURN FIELDS:
+1. hidden_states: Output tensor (batch, seq_len, hidden_size)
+2. present_key_value: Updated KV cache tuple (K, V)
+3. cos_cache: Precomputed RoPE cosine (optional, for reuse)
+4. sin_cache: Precomputed RoPE sine (optional, for reuse)
+5. residual: Residual tensor (optional, for attention blocks)
+
+BACKWARD COMPATIBILITY:
+- Supports tuple unpacking: attn_out, kv, cos, sin = output
+- Supports index access: output[0], output[1], etc.
+- Supports attribute access: output.hidden_states, output.present_key_value
+
+FORWARD FLOW ROUTING:
+1. If attention_chunk_size and cp_degree==1:
+   -> chunked_attention_forward()
+2. Else if attention_chunk_size and cp_degree>1:
+   -> chunked_attention_with_context_parallel_forward()
+3. Else if sliding_window enabled:
+   -> windowed_attention_forward()
+4. Else:
+   -> standard_causal_attention_forward()
+
+================================================================================
+4. QKV PROJECTION WITH QKVBIAS
+================================================================================
+
+PARAMETER CONTROL:
+Location: attention_base.py line 176
+- qkv_bias: bool = False
+  Controls whether QKV projections include bias terms
+- o_bias: bool = False
+  Controls whether output projection includes bias term
+
+FUSED QKV PATH:
+- Single ColumnParallelLinear layer
+- Output dim: (num_attention_heads + 2*num_key_value_heads) * head_dim
+- Bias tensor metadata: fused_qkv, num_attention_heads, num_key_value_heads, head_dim
+- Usage: When fused_qkv=True
+
+SEPARATED QKV PATH:
+- Three independent ColumnParallelLinear layers
+- Each has its own optional bias
+- Q: num_attention_heads * head_dim
+- K: num_key_value_heads * head_dim
+- V: num_key_value_heads * head_dim
+- Usage: When fused_qkv=False
+
+BIAS APPLICATION IN FORWARD:
+1. Bias built into ColumnParallelLinear constructor
+2. Applied automatically during linear transformation
+3. For fused: QKV = Wqkv @ hidden_states + bias (if enabled)
+4. For separated: Q = q_proj @ hidden_states + bias, etc.
+
+TOKEN GENERATION KERNEL:
+- Bias extracted if qkv_bias=True
+- Passed to TKG kernel via "bias_qkv" parameter
+- Shape: (1, output_dim) for kernel processing
+
+GRADIENT FLOW:
+- Bias parameters included in model.parameters()
+- Participate in optimizer updates
+- Sharded across TP degree in parallel layers
+
+================================================================================
+5. TENSOR SHAPE TRANSFORMATIONS
+================================================================================
+
+Input Pipeline:
+  hidden_states: (batch, seq_len, hidden_size)
+    |
+    v (QKV Projection)
+  Q: (batch, seq_len, num_heads * head_dim)
+  K: (batch, seq_len, num_kv_heads * head_dim)
+  V: (batch, seq_len, num_kv_heads * head_dim)
+    |
+    v (Layout Change: BSHD -> BHSD)
+  Q: (batch, num_heads, seq_len, head_dim)
+  K: (batch, num_kv_heads, seq_len, head_dim)
+  V: (batch, num_kv_heads, seq_len, head_dim)
+    |
+    v (RoPE Application)
+  Q, K: Updated with rotary embeddings
+    |
+    v (QK Norm - Optional)
+  Q, K: Normalized if use_qk_norm=True
+    |
+    v (Attention Computation)
+  Scores: (batch, num_heads, seq_len, seq_len)
+    |
+    v (With Learned Sinks - if enabled)
+  Scores: (batch, num_heads, seq_len, seq_len + 1)
+    |
+    v (Softmax)
+  Attention: (batch, num_heads, seq_len, seq_len)
+    |
+    v (Sink Cleanup)
+  Attention: (batch, num_heads, seq_len, seq_len)  [sink column removed]
+    |
+    v (Matmul with V)
+  Output: (batch, num_heads, seq_len, head_dim)
+    |
+    v (Merge Heads)
+  Output: (batch, seq_len, num_heads * head_dim)
+    |
+    v (Output Projection)
+  Final: (batch, seq_len, hidden_size)
+
+================================================================================
+6. CRITICAL IMPLEMENTATION NOTES
+================================================================================
+
+LEARNED SINKS:
+- Only size=1 is supported (asserted in LearnedSink.__init__)
+- Two separate instances for CP/DP stage differences
+- Automatically expanded and applied during attention
+- Removed post-softmax to maintain output shape consistency
+
+BIAS HANDLING:
+- Fused QKV: Single bias tensor with metadata attributes
+- Separated QKV: Three independent bias tensors
+- Output projection: Separate o_bias parameter
+- Kernel-aware: TKG kernels receive bias explicitly
+
+RoPE INTEGRATION:
+- Standard RoPE: via apply_rotary_pos_emb()
+- Polar-compatible RoPE: via apply_rotary_polar_compatible()
+- Precomputed caches reduce recomputation overhead
+- TKG kernel can fuse RoPE for token generation
+
+PARALLELISM STRATEGY:
+- TP: Default sharding across tensor ranks
+- CP: Gathers KV before attention, splits sequence
+- DP: Shards batch dimension during decode
+- Automatic selection based on configuration
+
+KERNEL SELECTION:
+- Flash attention: seq_len >= 4096 or explicitly enabled
+- TKG kernels: Only during token generation (past_key_value != None)
+- Fallback: Manual PyTorch implementation for all cases
+- Strategy: get_flash_attention_strategy() determines kernel
+
+OUTPUT PROJECTION:
+- Row parallel reduce_scatter pattern
+- Gathers attention output across TP ranks
+- Projects combined output to hidden_size
+- Optional bias handling
+
+================================================================================
+QUICK API REFERENCE
+================================================================================
+
+BASIC USAGE:
+  attention = NeuronAttentionBase(config, hidden_size, num_attention_heads, ...)
+  output = attention(hidden_states, attention_mask, position_ids)
+
+WITH LEARNED SINKS:
+  attention = NeuronAttentionBase(..., learned_sinks_size=1)
+  # Sinks automatically applied in attention computation
+
+WITH KV CACHING:
+  output = attention(
+      hidden_states,
+      past_key_value=cached_kv,
+      position_ids=current_pos,
+      active_mask=current_mask
+  )
+
+ACCESSING RESULTS:
+  # Tuple unpacking
+  attn_out, kv, cos_cache, sin_cache = output
+  
+  # Attribute access
+  attn_out = output.hidden_states
+  kv = output.present_key_value
+  
+  # Index access
+  attn_out = output[0]
+  kv = output[1]
+
+================================================================================
+DETAILED DOCUMENTATION FILES
+================================================================================
+
+1. neuron_attention_analysis.md
+   - Comprehensive 8-section analysis
+   - Detailed API documentation
+   - Implementation patterns and examples
+   - Configuration parameter reference
+
+2. neuron_attention_code_references.md
+   - Specific line numbers for all features
+   - Quick lookup tables
+   - Tensor shape transformations
+   - Code location index
+
+This file provides executive summary for quick reference.
+
+================================================================================
