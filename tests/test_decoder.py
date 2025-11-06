@@ -7,8 +7,8 @@ from unittest.mock import patch
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from model import NeuronGPTOSSBlock  # noqa: E402
-from gpt_oss import AttentionBlock, MLPBlock  # noqa: E402
+from src.model import NeuronGPTOSSBlock  # noqa: E402
+from src.gpt_oss import AttentionBlock, MLPBlock  # noqa: E402
 
 from neuronx_distributed_inference.utils.testing import build_module, validate_accuracy
 

@@ -9,12 +9,12 @@ from neuronx_distributed_inference.utils.testing import build_function, validate
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from model import (
+from src.model import (
     GPTOSSInferenceConfig,
     NeuronGPTOSSConfig,
 )
 
-from gpt_oss import swiglu
+from src.gpt_oss import swiglu
 
 def _make_tiny_inference_config():
     neuron_config = NeuronGPTOSSConfig(

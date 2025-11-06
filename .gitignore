@@ -11,3 +11,16 @@ artifacts/
 checkpoints/
 
 neuronxcc*/
+
+# Build and distribution
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+
+# Metrics and logs
+global_metric_store.json
+*.log

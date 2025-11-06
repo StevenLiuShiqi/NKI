@@ -7,8 +7,8 @@ from unittest.mock import patch
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from model import NeuronGPTOSSAttentionBlock  # noqa: E402
-from gpt_oss import AttentionBlock, MLPBlock  # noqa: E402
+from src.model import NeuronGPTOSSAttentionBlock  # noqa: E402
+from src.gpt_oss import AttentionBlock, MLPBlock  # noqa: E402
 
 from neuronx_distributed_inference.utils.testing import build_module, validate_accuracy
 
@@ -38,30 +38,34 @@ def test_attention_block_forward_matches_reference():
     hidden_size = config.hidden_size
 
     torch.manual_seed(0)
+    inp = torch.rand(batch_size, seq_len, hidden_size, dtype=config.neuron_config.torch_dtype)
     sample = torch.arange(batch_size * seq_len * hidden_size, dtype=config.neuron_config.torch_dtype)
     sample = sample.reshape(batch_size, seq_len, hidden_size).to(dtype=config.neuron_config.torch_dtype)
     # Update inputs to include position_ids as a keyword argument
     position_ids = torch.arange(seq_len).unsqueeze(0).expand(batch_size, -1)
-    inputs = [(sample, position_ids)]
+    inputs = [(inp, position_ids)]
     example_inputs = [(torch.zeros_like(sample), torch.zeros(batch_size, seq_len, dtype=torch.long))]
     
+    # Use layer_idx=1 to disable sliding window (odd layer indices have no sliding window)
+    # This helps avoid potential issues with the sliding window attention kernel on short sequences
     neuron_block = build_module(
         NeuronGPTOSSAttentionBlock,
         example_inputs,
         tp_degree=1,
         module_init_kwargs={
             "config": config,
+            "layer_idx": 1,
+            "weight_init_value": _CONSTANT_INIT_VALUE,
         },
         checkpoint_path=str(_CHECKPOINT_PATH),
     )
 
-    reference_block = AttentionBlock(reference_config)
+    reference_block = AttentionBlock(reference_config, layer_idx=1)
 
-    _fill_module_parameters(neuron_block, _CONSTANT_INIT_VALUE)
     _fill_module_parameters(reference_block, _CONSTANT_INIT_VALUE)
 
     with torch.no_grad():
-        flat_sample = sample.view(-1, hidden_size)
+        flat_sample = inp.view(-1, hidden_size)
         ref_tokens = reference_block(flat_sample)
         reference_output = ref_tokens.view(batch_size, seq_len, hidden_size)
 

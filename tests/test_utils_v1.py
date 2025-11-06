@@ -5,11 +5,11 @@ import torch
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from model import (
+from src.model import (
     GPTOSSInferenceConfig,
     NeuronGPTOSSConfig,
 )
-from gpt_oss import ModelConfig
+from src.gpt_oss import ModelConfig
 
 
 def _make_tiny_inference_config():
