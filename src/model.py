@@ -210,7 +210,7 @@ def convert_gptoss_to_neuron_state_dict(
 class NeuronGPTOSSConfig(MoENeuronConfig):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.fused_qkv = False
+        self.fused_qkv = True
 
 class GPTOSSInferenceConfig(InferenceConfig):
     def get_required_attributes(self) -> List[str]:
@@ -305,7 +305,7 @@ class NeuronGPTOSSAttentionBlock(NeuronAttentionBase):
             head_dim=config.head_dim,
             num_attention_heads=config.num_attention_heads,
             num_key_value_heads=config.num_key_value_heads,
-            rms_norm_eps=config.rms_norm_eps,
+            # rms_norm_eps=config.rms_norm_eps,
             rotary_emb=rotary_emb,
             qkv_bias=True,
             o_bias=True,

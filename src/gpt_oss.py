@@ -6,7 +6,6 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
-# from gpt_oss.torch.weights import Checkpoint
 
 
 @dataclass
@@ -215,7 +214,7 @@ class AttentionBlock(torch.nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        t = self.norm(x)
+        # t = self.norm(x)
         t = x
         qkv = self.qkv(t)
         q = qkv[:, : self.num_attention_heads * self.head_dim].contiguous()
@@ -256,12 +255,12 @@ def swiglu(x, alpha: float = 1.702, limit: float = 7.0):
     # Note we add an extra bias of 1 to the linear layer
     return out_glu * (x_linear + 1)
 
+
 class MLPBlock(torch.nn.Module):
     def __init__(
         self,
         config: ModelConfig,
         device: torch.device | None = None,
-        weight_init_value: float | None = None,
     ):
         super().__init__()
         self.num_experts = config.num_experts
@@ -310,22 +309,6 @@ class MLPBlock(torch.nn.Module):
             )
         )
 
-        if weight_init_value is not None:
-            self._initialize_weights(weight_init_value)
-
-    def _initialize_weights(self, weight_init_value: float) -> None:
-        # Fill every learnable parameter with a constant for deterministic behavior in tests.
-        with torch.no_grad():
-            if hasattr(self.norm, "scale"):
-                self.norm.scale.fill_(weight_init_value)
-            torch.nn.init.constant_(self.gate.weight, weight_init_value)
-            if self.gate.bias is not None:
-                torch.nn.init.constant_(self.gate.bias, weight_init_value)
-            self.mlp1_weight.fill_(weight_init_value)
-            self.mlp1_bias.fill_(weight_init_value)
-            self.mlp2_weight.fill_(weight_init_value)
-            self.mlp2_bias.fill_(weight_init_value)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         t = self.norm(x)
         g = self.gate(t)
@@ -350,145 +333,145 @@ class MLPBlock(torch.nn.Module):
         # Weighted sum of experts
         t = torch.einsum("bec,be->bc", t, expert_weights)
 
-        return t
+        return x + t
 
 
-# class TransformerBlock(torch.nn.Module):
-#     def __init__(
-#         self,
-#         config: ModelConfig,
-#         layer_idx: int,
-#         device: torch.device | None = None,
-#     ):
-#         super().__init__()
-#         self.layer_idx = layer_idx
-#         self.attn = AttentionBlock(config, layer_idx, device)
-#         self.mlp = MLPBlock(config, device)
+class TransformerBlock(torch.nn.Module):
+    def __init__(
+        self,
+        config: ModelConfig,
+        layer_idx: int,
+        device: torch.device | None = None,
+    ):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.attn = AttentionBlock(config, layer_idx, device)
+        self.mlp = MLPBlock(config, device)
 
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         x = self.attn(x)
-#         x = self.mlp(x)
-#         return x
-
-
-# class Transformer(torch.nn.Module):
-#     def __init__(
-#         self,
-#         config: ModelConfig,
-#         device: torch.device | None = None,
-#     ):
-#         super().__init__()
-#         self.embedding = torch.nn.Embedding(
-#             config.vocab_size, config.hidden_size, device=device, dtype=torch.bfloat16
-#         )
-#         self.block = torch.nn.ModuleList(
-#             [
-#                 TransformerBlock(config, layer_idx, device)
-#                 for layer_idx in range(config.num_hidden_layers)
-#             ]
-#         )
-#         self.norm = RMSNorm(config.hidden_size, device=device)
-#         self.unembedding = torch.nn.Linear(
-#             config.hidden_size,
-#             config.vocab_size,
-#             bias=False,
-#             device=device,
-#             dtype=torch.bfloat16,
-#         )
-
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         x = self.embedding(x)
-#         for block in self.block:
-#             x = block(x)
-#         x = self.norm(x)
-#         x = self.unembedding(x)
-#         return x
-
-#     @staticmethod
-#     def from_checkpoint(
-#         path: str, device: str | torch.device = "cuda"
-#     ) -> "Transformer":
-#         if not isinstance(device, torch.device):
-#             device = torch.device(device)
-
-#         config_path = os.path.join(path, "config.json")
-#         with open(config_path, "r") as f:
-#             json_config = json.load(f)
-#             config = ModelConfig(**json_config)
-
-#         model = Transformer(
-#             config=config,
-#             device=device,
-#         )
-#         model.eval()
-
-#         # Load weights
-#         my_rank = dist.get_rank() if dist.is_initialized() else 0
-#         world_size = dist.get_world_size() if dist.is_initialized() else 1
-#         per_rank_intermediate_size = config.intermediate_size // world_size
-
-#         checkpoint = Checkpoint(path, device)
-
-#         for name, param in model.named_parameters():
-#             loaded_tensor = checkpoint.get(name)
-
-#             # Note: it would be more efficient to do sharding before upcasting from MXFP4,
-#             # but for simplicity we do it after.
-#             if "mlp1" in name:  # both weight and bias
-#                 loaded_tensor = loaded_tensor[
-#                     :,
-#                     my_rank * 2
-#                     * per_rank_intermediate_size : (my_rank + 1) * 2
-#                     * per_rank_intermediate_size,
-#                     ...,
-#                 ]
-#             elif "mlp2_weight" in name:  # only weight
-#                 loaded_tensor = loaded_tensor[
-#                     ...,
-#                     my_rank
-#                     * per_rank_intermediate_size : (my_rank + 1)
-#                     * per_rank_intermediate_size,
-#                 ]
-#             try:
-#                 param.data.copy_(loaded_tensor)
-#             except:
-#                 print(f"{name=} {param.data.shape=} {loaded_tensor.shape=}")
-#                 raise
-
-#         return model
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.attn(x)
+        x = self.mlp(x)
+        return x
 
 
-# class TokenGenerator:
-#     @torch.inference_mode()
-#     def __init__(self, checkpoint: str, device: torch.device):
-#         self.device = device
-#         self.model = Transformer.from_checkpoint(checkpoint, device=self.device)
+class Transformer(torch.nn.Module):
+    def __init__(
+        self,
+        config: ModelConfig,
+        device: torch.device | None = None,
+    ):
+        super().__init__()
+        self.embedding = torch.nn.Embedding(
+            config.vocab_size, config.hidden_size, device=device, dtype=torch.bfloat16
+        )
+        self.block = torch.nn.ModuleList(
+            [
+                TransformerBlock(config, layer_idx, device)
+                for layer_idx in range(config.num_hidden_layers)
+            ]
+        )
+        self.norm = RMSNorm(config.hidden_size, device=device)
+        self.unembedding = torch.nn.Linear(
+            config.hidden_size,
+            config.vocab_size,
+            bias=False,
+            device=device,
+            dtype=torch.bfloat16,
+        )
 
-#     @torch.inference_mode()
-#     def generate(self,
-#                  prompt_tokens: list[int],
-#                  stop_tokens: list[int],
-#                  temperature: float = 1.0,
-#                  max_tokens: int = 0,
-#                  return_logprobs: bool = False):
-#         tokens = list(prompt_tokens)
-#         num_generated_tokens = 0
-#         while max_tokens == 0 or num_generated_tokens < max_tokens:
-#             logits = self.model(torch.as_tensor(tokens, dtype=torch.int32, device=self.device))[-1]
-#             if temperature == 0.0:
-#                 predicted_token = torch.argmax(logits, dim=-1).item()
-#             else:
-#                 probs = torch.softmax(logits * (1.0 / temperature), dim=-1)
-#                 predicted_token = torch.multinomial(probs, num_samples=1).item()
-#             tokens.append(predicted_token)
-#             num_generated_tokens += 1
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.embedding(x)
+        for block in self.block:
+            x = block(x)
+        x = self.norm(x)
+        x = self.unembedding(x)
+        return x
 
-#             if return_logprobs:
-#                 logprobs = torch.log_softmax(logits, dim=-1)
-#                 selected_logprobs = logprobs[predicted_token].item()
-#                 yield predicted_token, selected_logprobs
-#             else:
-#                 yield predicted_token
+    @staticmethod
+    def from_checkpoint(
+        path: str, device: str | torch.device = "cuda"
+    ) -> "Transformer":
+        if not isinstance(device, torch.device):
+            device = torch.device(device)
 
-#             if predicted_token in stop_tokens:
-#                 break
+        config_path = os.path.join(path, "config.json")
+        with open(config_path, "r") as f:
+            json_config = json.load(f)
+            config = ModelConfig(**json_config)
+
+        model = Transformer(
+            config=config,
+            device=device,
+        )
+        model.eval()
+
+        # Load weights
+        my_rank = dist.get_rank() if dist.is_initialized() else 0
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        per_rank_intermediate_size = config.intermediate_size // world_size
+
+        checkpoint = Checkpoint(path, device)
+
+        for name, param in model.named_parameters():
+            loaded_tensor = checkpoint.get(name)
+
+            # Note: it would be more efficient to do sharding before upcasting from MXFP4,
+            # but for simplicity we do it after.
+            if "mlp1" in name:  # both weight and bias
+                loaded_tensor = loaded_tensor[
+                    :,
+                    my_rank * 2
+                    * per_rank_intermediate_size : (my_rank + 1) * 2
+                    * per_rank_intermediate_size,
+                    ...,
+                ]
+            elif "mlp2_weight" in name:  # only weight
+                loaded_tensor = loaded_tensor[
+                    ...,
+                    my_rank
+                    * per_rank_intermediate_size : (my_rank + 1)
+                    * per_rank_intermediate_size,
+                ]
+            try:
+                param.data.copy_(loaded_tensor)
+            except:
+                print(f"{name=} {param.data.shape=} {loaded_tensor.shape=}")
+                raise
+
+        return model
+
+
+class TokenGenerator:
+    @torch.inference_mode()
+    def __init__(self, checkpoint: str, device: torch.device):
+        self.device = device
+        self.model = Transformer.from_checkpoint(checkpoint, device=self.device)
+
+    @torch.inference_mode()
+    def generate(self,
+                 prompt_tokens: list[int],
+                 stop_tokens: list[int],
+                 temperature: float = 1.0,
+                 max_tokens: int = 0,
+                 return_logprobs: bool = False):
+        tokens = list(prompt_tokens)
+        num_generated_tokens = 0
+        while max_tokens == 0 or num_generated_tokens < max_tokens:
+            logits = self.model(torch.as_tensor(tokens, dtype=torch.int32, device=self.device))[-1]
+            if temperature == 0.0:
+                predicted_token = torch.argmax(logits, dim=-1).item()
+            else:
+                probs = torch.softmax(logits * (1.0 / temperature), dim=-1)
+                predicted_token = torch.multinomial(probs, num_samples=1).item()
+            tokens.append(predicted_token)
+            num_generated_tokens += 1
+
+            if return_logprobs:
+                logprobs = torch.log_softmax(logits, dim=-1)
+                selected_logprobs = logprobs[predicted_token].item()
+                yield predicted_token, selected_logprobs
+            else:
+                yield predicted_token
+
+            if predicted_token in stop_tokens:
+                break

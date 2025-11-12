@@ -20,6 +20,7 @@ def _make_tiny_inference_config():
         torch_dtype="bfloat16",
         # glu_mlp=True,
         capacity_factor=None,
+        fused_qkv=True
     )
     return GPTOSSInferenceConfig(
         neuron_config=neuron_config,
@@ -44,7 +45,7 @@ def _make_original_inference_config():
     neuron_config = NeuronGPTOSSConfig(
         batch_size=1,
         seq_len=4096,
-        tp_degree=8,
+        tp_degree=1,
         torch_dtype=torch.bfloat16,
         capacity_factor=None,
     )
