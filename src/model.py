@@ -387,7 +387,7 @@ class NeuronGPTOSSBlock(nn.Module):
         self.hidden_size = config.hidden_size
         self.block_idx = block_idx
         
-        self.self_attn = NeuronGPTOSSAttentionBlock(config=config)
+        self.self_attn = NeuronGPTOSSAttentionBlock(config=config, layer_idx=self.block_idx)
         self.ffn = NeuronGPTOSSMLPBlock(config=config)
         
         # RMS Norm
