@@ -15,6 +15,10 @@ from torch import nn
 from dataclasses import dataclass
 from transformers import AutoModelForCausalLM
 
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from src.moe_classes import NeuronGPTOSSExpertMLPs
 
 from neuronx_distributed.modules.moe.routing import RouterTopK
@@ -38,6 +42,7 @@ import gc
 import re
 import torch
 
+
 def convert_gptoss_to_neuron_state_dict(
     gptoss_sd: dict,
     config,
@@ -51,7 +56,7 @@ def convert_gptoss_to_neuron_state_dict(
     Convert GPT-OSS checkpoint to NXD (trace) expected keys.
 
     Emits keys:
-      layers.{L}.self_attn.qkv_proj.{q_proj,k_proj,v_proj}.{weight,bias}
+      layers.{L}.self_attn.Wqkv.{weight,bias}  (fused Q/K/V projection)
       layers.{L}.self_attn.o_proj.o_proj.{weight,bias}
       layers.{L}.self_attn.learned_sinks.sink (if present)
       layers.{L}.self_attn.tkg_learned_sinks.sink (if present)
@@ -118,15 +123,26 @@ def convert_gptoss_to_neuron_state_dict(
         })
 
         for idx, L in enumerate(layer_ids):
-            # ===== Attention: q/k/v -> qkv_proj.{q_proj,k_proj,v_proj}.{weight,bias}
-            for proj in ("q", "k", "v"):
+            # ===== Attention: q/k/v -> fused Wqkv.{weight,bias}
+            q_w = take(f"model.layers.{L}.self_attn.q_proj.weight", None)
+            k_w = take(f"model.layers.{L}.self_attn.k_proj.weight", None)
+            v_w = take(f"model.layers.{L}.self_attn.v_proj.weight", None)
 
-                w = take(f"model.layers.{L}.self_attn.{proj}_proj.weight", None)
-                if w is not None:
-                    nsd[f"layers.{L}.self_attn.qkv_proj.{proj}_proj.weight"] = to_target(w)
-                b = take(f"model.layers.{L}.self_attn.{proj}_proj.bias", None)
-                if b is not None:
-                    nsd[f"layers.{L}.self_attn.qkv_proj.{proj}_proj.bias"] = to_target(b)
+            # Fuse QKV weights by concatenating along dim 0
+            if q_w is not None and k_w is not None and v_w is not None:
+                # Shapes: (q_out, H), (k_out, H), (v_out, H) -> (q_out+k_out+v_out, H)
+                fused_qkv_weight = torch.cat([q_w, k_w, v_w], dim=0)
+                nsd[f"layers.{L}.self_attn.qkv_proj.Wqkv.weight"] = to_target(fused_qkv_weight)
+
+            # Fuse QKV biases by concatenating
+            q_b = take(f"model.layers.{L}.self_attn.q_proj.bias", None)
+            k_b = take(f"model.layers.{L}.self_attn.k_proj.bias", None)
+            v_b = take(f"model.layers.{L}.self_attn.v_proj.bias", None)
+
+            if q_b is not None and k_b is not None and v_b is not None:
+                # Shapes: (q_out,), (k_out,), (v_out,) -> (q_out+k_out+v_out,)
+                fused_qkv_bias = torch.cat([q_b, k_b, v_b], dim=0)
+                nsd[f"layers.{L}.self_attn.qkv_proj.Wqkv.bias"] = to_target(fused_qkv_bias)
 
             # ===== Attention: out-proj -> o_proj.o_proj.{weight,bias}
             ow = take(f"model.layers.{L}.self_attn.o_proj.weight", None)
@@ -206,7 +222,6 @@ def convert_gptoss_to_neuron_state_dict(
         gc.collect()
         return nsd
 
-    
 class NeuronGPTOSSConfig(MoENeuronConfig):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -249,7 +264,7 @@ class NeuronGPTOSSMLPBlock(torch.nn.Module):
             act_fn="softmax",  # matches your softmax
             dtype=torch.bfloat16,
             device=device,
-            # bias=False, 
+            bias=True, 
             sequence_parallel_enabled=False,  # adjust based on your setup
         )
         
@@ -363,7 +378,7 @@ class NeuronGPTOSSAttentionBlock(NeuronAttentionBase):
         )
 
         # Return just the hidden states to match reference implementation
-        return tuple(output)[0]
+        return output
 
 class NeuronGPTOSSBlock(nn.Module):
     def __init__(self, config: GPTOSSInferenceConfig, block_idx: int):
