@@ -13,7 +13,7 @@ from typing import List, Optional, Tuple, Type
 import torch
 from torch import nn
 from dataclasses import dataclass
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, GptOssForCausalLM
 
 import sys
 import os
@@ -27,7 +27,7 @@ from neuronx_distributed.modules.rms_norm import RMSNorm
 from neuronx_distributed_inference.models.config import InferenceConfig, MoENeuronConfig
 from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
-from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear
+from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, ParallelEmbedding
 from neuronx_distributed_inference.models.model_base import (
     NeuronBaseForCausalLM,
     NeuronBaseModel,
@@ -266,7 +266,7 @@ class NeuronGPTOSSMLPBlock(torch.nn.Module):
             apply_act_fn_over_topk=True,
             dtype=torch.bfloat16,
             device=device,
-            bias=False, 
+            bias=True, 
             sequence_parallel_enabled=False,  # adjust based on your setup
         )
         
@@ -280,7 +280,7 @@ class NeuronGPTOSSMLPBlock(torch.nn.Module):
             glu_mlp=True,  # SwiGLU is a GLU variant
             # glu_type=GLUType.SWIGLU,  # specify SwiGLU
             capacity_factor=None,  # full capacity (no dropping)
-            normalize_top_k_affinities=False,  # your softmax normalizes
+            normalize_top_k_affinities=False, 
             # bias=False,  # as you mentioned
             dtype=torch.bfloat16,
             device=device,
@@ -401,8 +401,8 @@ class NeuronGPTOSSBlock(nn.Module):
         self.ffn = NeuronGPTOSSMLPBlock(config=config)
         
         # RMS Norm
-        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # Final linear
         
         
@@ -461,18 +461,27 @@ class NeuronGPTOSSModel(NeuronBaseModel):
             embedding_dim=config.hidden_size,
             padding_idx=getattr(config, "pad_token_id", None),
         ) # FIX
+        self.vocab_size = config.vocab_size
+        
+        self.embed_tokens = ParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            config.pad_token_id,
+            dtype=config.neuron_config.torch_dtype,
+            shard_across_embedding=True,
+        )
         
         self.layers = nn.ModuleList(
             [NeuronGPTOSSBlock(config, block_idx) for block_idx in range(config.num_hidden_layers)]
         )
         
-        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = ColumnParallelLinear(
             config.hidden_size,
             config.vocab_size,
             gather_output=not self.on_device_sampling,
             bias=False,
-            pad=True,
+            # pad=True,
             # tensor_model_parallel_group=get_tp_group(config),
         )
 
@@ -486,7 +495,7 @@ class NeuronGPTOSSForCausalLM(NeuronBaseForCausalLM):
 
     @staticmethod
     def load_hf_model(model_path, **kwargs):
-        return AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
+        return GptOssForCausalLM.from_pretrained(model_path, **kwargs)
     
     @staticmethod
     def convert_hf_to_neuron_state_dict(state_dict: dict, config: InferenceConfig) -> dict:
