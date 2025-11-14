@@ -45,7 +45,7 @@ def _make_original_inference_config():
     neuron_config = NeuronGPTOSSConfig(
         batch_size=1,
         seq_len=4096,
-        tp_degree=1,
+        tp_degree=8,
         torch_dtype=torch.bfloat16,
         capacity_factor=None,
     )

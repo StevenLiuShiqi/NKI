@@ -26,7 +26,7 @@ _ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 _CHECKPOINT_PATH = _ARTIFACTS_DIR / "neuron_block_checkpoint.pt"
 
 def test_block_forward_matches_reference():
-    config = _make_original_inference_config()
+    config = _make_tiny_inference_config()
     reference_config = _get_ref_config(config=config)
 
     if _CHECKPOINT_PATH.exists():
@@ -65,7 +65,7 @@ def test_block_forward_matches_reference():
     neuron_block = build_module(
         BlockWrapper,
         example_inputs,
-        tp_degree=1,
+        tp_degree=8,
         module_init_kwargs={
             "config": config,
             "block_idx": 1,
