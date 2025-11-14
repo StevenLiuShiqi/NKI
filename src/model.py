@@ -232,8 +232,9 @@ class GPTOSSInferenceConfig(InferenceConfig):
         return [
         "hidden_size", "num_attention_heads", "num_key_value_heads",
         "head_dim", "vocab_size", "max_position_embeddings",
-        "num_hidden_layers", "rms_norm_eps", "pad_token_id",
+        "num_hidden_layers", "rms_norm_eps", "pad_token_id", "rope_theta",
         # MoE
+        "num_local_experts", "num_experts_per_tok", "intermediate_size",
         ]
 
     @classmethod
