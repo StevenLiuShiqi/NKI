@@ -262,9 +262,10 @@ class NeuronGPTOSSMLPBlock(torch.nn.Module):
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             act_fn="softmax",  # matches your softmax
+            apply_act_fn_over_topk=True,
             dtype=torch.bfloat16,
             device=device,
-            bias=True, 
+            bias=False, 
             sequence_parallel_enabled=False,  # adjust based on your setup
         )
         
@@ -278,14 +279,22 @@ class NeuronGPTOSSMLPBlock(torch.nn.Module):
             glu_mlp=True,  # SwiGLU is a GLU variant
             # glu_type=GLUType.SWIGLU,  # specify SwiGLU
             capacity_factor=None,  # full capacity (no dropping)
-            normalize_top_k_affinities=True,  # your softmax normalizes
+            normalize_top_k_affinities=False,  # your softmax normalizes
             # bias=False,  # as you mentioned
             dtype=torch.bfloat16,
             device=device,
             tensor_model_parallel_group=None,  # set if using TP
             # sequence_parallel_enabled=False,
         )
-        
+        if weight_init_value is not None:
+            self._initialize_weights(weight_init_value)
+    
+    def _initialize_weights(self, value: float) -> None:
+        """Initialize all parameters to a constant value for deterministic testing."""
+        with torch.no_grad():
+            for param in self.parameters():
+                param.fill_(value)
+                   
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Original: x → norm → gate → topk → expert_mlps → weighted_sum → x + residual
         # With MoE blocks: x → MoE (does all of the above) → x + residual
@@ -421,7 +430,7 @@ class NeuronGPTOSSBlock(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states).to(dtype=hidden_states.dtype)
         
         # MoE
-        hidden_states = self.ffn(hidden_states)[0] # not sure why indexing
+        hidden_states = self.ffn(hidden_states) 
         hidden_states = residual + hidden_states
         
         outputs = (hidden_states, present_key_value, cos_cache, sin_cache, None)
