@@ -13,7 +13,7 @@ from typing import List, Optional, Tuple, Type
 import torch
 from torch import nn
 from dataclasses import dataclass
-from transformers import AutoModelForCausalLM, GptOssForCausalLM
+from transformers import AutoModelForCausalLM
 
 import sys
 import os
@@ -388,7 +388,7 @@ class NeuronGPTOSSAttentionBlock(NeuronAttentionBase):
         )
 
         # Return just the hidden states to match reference implementation
-        return output
+        return output[0]
 
 class NeuronGPTOSSBlock(nn.Module):
     def __init__(self, config: GPTOSSInferenceConfig, block_idx: int):
@@ -495,7 +495,7 @@ class NeuronGPTOSSForCausalLM(NeuronBaseForCausalLM):
 
     @staticmethod
     def load_hf_model(model_path, **kwargs):
-        return GptOssForCausalLM.from_pretrained(model_path, **kwargs)
+        return AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
     
     @staticmethod
     def convert_hf_to_neuron_state_dict(state_dict: dict, config: InferenceConfig) -> dict:

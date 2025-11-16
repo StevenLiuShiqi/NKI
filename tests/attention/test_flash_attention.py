@@ -15,16 +15,15 @@ import numpy as np
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.gpt_oss import sdpa
 
-from custom_flash_attn import (
-    flash_fwd,
-    FlashConfig,
+from neuronx_distributed_inference.modules.sliding_window.attention import (
+    flash_fwd, FlashConfig,
 )
 from neuronx_distributed_inference.utils.testing import build_module, validate_accuracy
 
 from test_utils import (
     _make_tiny_inference_config,
+    _make_original_inference_config
 )
 
 _CONSTANT_INIT_VALUE = 0.5
@@ -106,6 +105,29 @@ class FlashAttentionModule(nn.Module):
         return output
 
 
+def sdpa(Q, K, V, S, sm_scale, sliding_window=0):
+    # sliding_window == 0 means no sliding window
+    n_tokens, n_heads, q_mult, d_head = Q.shape
+    assert K.shape == (n_tokens, n_heads, d_head)
+    assert V.shape == (n_tokens, n_heads, d_head)
+    K = K[:, :, None, :].expand(-1, -1, q_mult, -1)
+    V = V[:, :, None, :].expand(-1, -1, q_mult, -1)
+    S = S.reshape(n_heads, q_mult, 1, 1).expand(-1, -1, n_tokens, -1)
+    mask = torch.triu(Q.new_full((n_tokens, n_tokens), -float("inf")), diagonal=1)
+    if sliding_window > 0:
+        mask += torch.tril(
+            mask.new_full((n_tokens, n_tokens), -float("inf")), diagonal=-sliding_window
+        )
+    QK = torch.einsum("qhmd,khmd->hmqk", Q, K)
+    QK *= sm_scale
+    QK += mask[None, None, :, :]
+    # QK = torch.cat([QK, S], dim=-1)
+    W = torch.softmax(QK, dim=-1)
+    # W = W[..., :-1]
+    attn = torch.einsum("hmqk,khmd->qhmd", W, V)
+    return attn.reshape(n_tokens, -1)
+
+
 class SDPAModule(nn.Module):
     """
     Wrapper module for reference SDPA implementation.
@@ -172,7 +194,7 @@ def test_flash_attention_vs_sdpa():
     print("TEST: FlashAttention vs Reference SDPA")
     print("="*80)
 
-    config = _make_tiny_inference_config()
+    config = _make_original_inference_config()
 
     # Override seq_len to be divisible by FlashAttention tile size
     # Use 2048 (default tile size) for proper testing
