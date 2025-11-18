@@ -113,7 +113,9 @@ if __name__ == '__main__':
 
     for name, module in model.named_modules():
         module_type = type(module)
-        if name not in ('', 'model') and not module_type.__module__.startswith('torch'):
+        if not module_type.__module__.startswith('torch'):
+            if not name:
+                name = 'default'
             module_types_to_names_and_modules.setdefault(module_type, []).append((name, module))
 
     for names_and_modules in module_types_to_names_and_modules.values():
