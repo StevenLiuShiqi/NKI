@@ -1,0 +1,1311 @@
+[
+  {
+    "module_id": "nxdi_attention_prefill_flash_cp_nonstrided",
+    "nxdi_class": "NeuronAttentionBase",
+    "execution_path": {
+      "stage": "prefill",
+      "method": "context_parallel_flash_attention_kernel",
+      "conditions": {
+        "cp_degree": ">1",
+        "flash_attention_strategy": "CONTEXT_PARALLEL_KERNEL",
+        "strided_context_parallel_kernel_enabled": false,
+        "logical_nc_config": ">=2",
+        "q_len": ">head_dim",
+        "sliding_window": null
+      }
+    },
+    "mathematical_operations": [
+      {
+        "step": 1,
+        "op": "qkv_projection",
+        "formula": "Q, K, V = split(X @ W_qkv + b_qkv, [n_q*d, n_kv*d, n_kv*d])",
+        "input_shape": ["B", "S", "hidden_size"],
+        "output_shapes": [["B", "S", "n_q*d"], ["B", "S", "n_kv*d"], ["B", "S", "n_kv*d"]],
+        "weights": {
+          "W_qkv": ["n_q*d + 2*n_kv*d", "hidden_size"],
+          "b_qkv": ["n_q*d + 2*n_kv*d"]
+        },
+        "implementation": "GroupQueryAttention_QKV"
+      },
+      {
+        "step": 2,
+        "op": "qk_normalization",
+        "formula": "Q = RMSNorm(Q), K = RMSNorm(K) if qk_norm_placement=PRE_ROPE",
+        "input_shape": ["B", "S", "n_q*d"],
+        "output_shape": ["B", "S", "n_q*d"],
+        "implementation": "CustomRMSNorm"
+      },
+      {
+        "step": 3,
+        "op": "reshape_heads",
+        "formula": "Q = Q.view(B, S, H, D).transpose(1,2); K = K.view(B, S, H_kv, D).transpose(1,2); V = V.view(B, S, H_kv, D).transpose(1,2)",
+        "input_shape": ["B", "S", "H*D"],
+        "output_shape": ["B", "H", "S", "D"],
+        "output_layout": "BHSD"
+      },
+      {
+        "step": 4,
+        "op": "rope",
+        "formula": "Q, K = apply_rotary_pos_emb(Q, K, cos_cache, sin_cache)",
+        "input_shape": ["B", "H", "S", "D"],
+        "output_shape": ["B", "H", "S", "D"],
+        "implementation": "apply_rotary_pos_emb"
+      },
+      {
+        "step": 5,
+        "op": "gather_kv_cp",
+        "formula": "K, V = gather_from_tensor_model_parallel_region([K, V], dim=3, cp_group)",
+        "input_shape": ["B", "H", "S/CP", "D"],
+        "output_shape": ["B", "H", "S", "D"],
+        "implementation": "gather_from_tensor_model_parallel_region_with_dim"
+      },
+      {
+        "step": 6,
+        "op": "repeat_kv",
+        "formula": "K = repeat_kv(K, num_key_value_groups); V = repeat_kv(V, num_key_value_groups)",
+        "input_shape": ["B", "H_kv", "S", "D"],
+        "output_shape": ["B", "H", "S", "D"]
+      },
+      {
+        "step": 7,
+        "op": "reshape_for_kernel",
+        "formula": "Q = Q.reshape(B*H, S, D) / sqrt(D); K = K.reshape(B*H, S*CP, D).permute(0,2,1); V = V.reshape(B*H, S*CP, D)",
+        "input_shape": ["B", "H", "S", "D"],
+        "output_shape": ["B*H", "D", "S"],
+        "output_layout": "BHD*S for Q; BHDS* for K,V"
+      },
+      {
+        "step": 8,
+        "op": "flash_attention_cp",
+        "formula": "O = FlashAttention_CP(Q, K, V, scale=1.0)",
+        "input_shape": ["B*H", "D", "S"],
+        "output_shape": ["B*H", "D", "S"],
+        "kernel_params": {
+          "function": "_flash_fwd_call",
+          "source": "neuronxcc.nki._private_kernels.attention.attention_isa_kernel",
+          "kernel_name": "CausalAttentionMMSoftmaxMMWithoutSwap",
+          "grid": ["nc(logical_nc_config)"],
+          "Q_shape": ["B*H", "S", "D"],
+          "K_shape": ["B*H", "D", "S*CP"],
+          "V_shape": ["B*H", "S*CP", "D"],
+          "out_shape": ["B*H", "D", "S"],
+          "use_dma_transpose": true,
+          "global_n_tiles": "cp_degree",
+          "tile_i": "cp_rank * q_len",
+          "layout_note": "Q scaled by 1/sqrt(D) before kernel"
+        }
+      },
+      {
+        "step": 9,
+        "op": "reshape_output",
+        "formula": "O = O.reshape(B, H, D, S).permute(0,3,1,2)",
+        "input_shape": ["B*H", "D", "S"],
+        "output_shape": ["B", "S", "H", "D"],
+        "output_layout": "BSHD"
+      },
+      {
+        "step": 10,
+        "op": "output_projection",
+        "formula": "Y = (O.reshape(B, S, H*D)) @ W_o + b_o",
+        "input_shape": ["B", "S", "H*D"],
+        "output_shape": ["B", "S", "hidden_size"],
+        "weights": {
+          "W_o": ["hidden_size", "H*D"],
+          "b_o": ["hidden_size"]
+        },
+        "implementation": "GroupQueryAttention_O"
+      }
+    ],
+    "special_features": {
+      "learned_sinks": {
+        "enabled": false,
+        "size": null,
+        "shape": null,
+        "usage": "Can be enabled via learned_sinks_size parameter"
+      },
+      "sliding_window": {
+        "enabled": false,
+        "window_size": null,
+        "mask_formula": null,
+        "note": "Can be enabled via sliding_window parameter"
+      },
+      "qk_normalization": {
+        "enabled": false,
+        "placement": null,
+        "eps": null
+      },
+      "kv_cache": {
+        "enabled": false,
+        "K_cache_shape": null,
+        "V_cache_shape": null,
+        "K_transposed": null,
+        "update_in_kernel": false
+      }
+    },
+    "source_reference": {
+      "file": "attention_base.py",
+      "class": "NeuronAttentionBase",
+      "method": "context_parallel_flash_attention_kernel",
+      "line_range": [547, 607]
+    }
+  },
+  {
+    "module_id": "nxdi_attention_prefill_flash_cp_strided",
+    "nxdi_class": "NeuronAttentionBase",
+    "execution_path": {
+      "stage": "prefill",
+      "method": "context_parallel_flash_attention_kernel",
+      "conditions": {
+        "cp_degree": ">1",
+        "flash_attention_strategy": "STRIDED_CONTEXT_PARALLEL_KERNEL",
+        "strided_context_parallel_kernel_enabled": true,
+        "logical_nc_config": ">=2",
+        "q_len": ">head_dim",
+        "sliding_window": null
+      }
+    },
+    "mathematical_operations": [
+      {
+        "step": 1,
+        "op": "qkv_projection",
+        "formula": "Q, K, V = split(X @ W_qkv, [n_q*d, n_kv*d, n_kv*d])",
+        "input_shape": ["B", "S", "hidden_size"],
+        "output_shapes": [["B", "S", "n_q*d"], ["B", "S", "n_kv*d"], ["B", "S", "n_kv*d"]],
+        "weights": {"W_qkv": ["n_q*d + 2*n_kv*d", "hidden_size"]},
+        "implementation": "GroupQueryAttention_QKV"
+      },
+      {
+        "step": 2,
+        "op": "reshape_heads",
+        "formula": "Q, K, V = move_heads_front(Q, K, V)",
+        "input_shape": ["B", "S", "H*D"],
+        "output_shape": ["B", "H", "S", "D"],
+        "output_layout": "BHSD"
+      },
+      {
+        "step": 3,
+        "op": "rope",
+        "formula": "Q, K = apply_rotary_pos_emb(Q, K, cos, sin)",
+        "input_shape": ["B", "H", "S", "D"],
+        "output_shape": ["B", "H", "S", "D"]
+      },
+      {
+        "step": 4,
+        "op": "gather_kv_cp",
+        "formula": "K, V = gather([K, V], dim=3, cp_group)",
+        "input_shape": ["B", "H", "S/CP", "D"],
+        "output_shape": ["B", "H", "S", "D"]
+      },
+      {
+        "step": 5,
+        "op": "strided_reorder",
+        "formula": "K, V = order_strided_tensor([K, V], dim=3, cp_degree)",
+        "input_shape": ["B", "H", "S", "D"],
+        "output_shape": ["B", "H", "S", "D"],
+        "note": "Reorders tensor for strided Q slicing"
+      },
+      {
+        "step": 6,
+        "op": "repeat_kv",
+        "formula": "K = repeat_kv(K, num_kv_groups); V = repeat_kv(V, num_kv_groups)",
+        "input_shape": ["B", "H_kv", "S", "D"],
+        "output_shape": ["B", "H", "S", "D"]
+      },
+      {
+        "step": 7,
+        "op": "reshape_for_kernel",
+        "formula": "Q = Q.reshape(B*H, S, D) / sqrt(D); K = K.reshape(B*H, S*CP, D).permute(0,2,1); V = V.reshape(B*H, S*CP, D)",
+        "input_shape": ["B", "H", "S", "D"],
+        "output_shape": ["B*H", "D", "S"]
+      },
+      {
+        "step": 8,
+        "op": "flash_attention_cp_strided",
+        "formula": "O = FlashAttention_CP_Strided(Q, K, V, scale=1.0)",
+        "input_shape": ["B*H", "D", "S"],
+        "output_shape": ["B*H", "D", "S"],
+        "kernel_params": {
+          "function": "_flash_fwd_call",
+          "source": "neuronxcc.nki._private_kernels.attention.attention_isa_kernel",
+          "kernel_name": "CausalAttentionMMSoftmaxMMWithoutSwap",
+          "grid": ["nc(logical_nc_config)"],
+          "Q_shape": ["B*H", "S", "D"],
+          "K_shape": ["B*H", "D", "S*CP"],
+          "V_shape": ["B*H", "S*CP", "D"],
+          "out_shape": ["B*H", "D", "S"],
+          "use_dma_transpose": true,
+          "global_n_tiles": "cp_degree",
+          "tile_i": "cp_rank",
+          "strided_q_slicing": true
+        }
+      },
+      {
+        "step": 9,
+        "op": "reshape_output",
+        "formula": "O = O.reshape(B, H, D, S).permute(0,3,1,2)",
+        "input_shape": ["B*H", "D", "S"],
+        "output_shape": ["B", "S", "H", "D"],
+        "output_layout": "BSHD"
+      },
+      {
+        "step": 10,
+        "op": "output_projection",
+        "formula": "Y = O.reshape(B, S, H*D) @ W_o",
+        "input_shape": ["B", "S", "H*D"],
+        "output_shape": ["B", "S", "hidden_size"],
+        "weights": {"W_o": ["hidden_size", "H*D"]}
+      }
+    ],
+    "special_features": {
+      "learned_sinks": {"enabled": false},
+      "sliding_window": {"enabled": false},
+      "qk_normalization": {"enabled": false},
+      "kv_cache": {"enabled": false}
+    },
+    "source_reference": {
+      "file": "attention_base.py",
+      "class": "NeuronAttentionBase",
+      "method": "context_parallel_flash_attention_kernel",
+      "line_range": [547, 607]
+    }
+  },
+  {
+    "module_id": "nxdi_attention_prefill_flash_sharded",
+    "nxdi_class": "NeuronAttentionBase",
+    "execution_path": {
+      "stage": "prefill",
+      "method": "perform_prefill",
+      "conditions": {
+        "cp_degree": 1,
+        "flash_attention_strategy": "SHARDED_KERNEL",
+        "logical_nc_config": ">1",
+        "q_len": ">=1024 and divisible by 512, OR <1024 and divisible by 256",
+        "attn_kernel_enabled": "!= False",
+        "has_attention_mask": true
+      }
+    },
+    "mathematical_operations": [
+      {
+        "step": 1,
+        "op": "qkv_projection",
+        "formula": "Q, K, V = split(X @ W_qkv, [n_q*d, n_kv*d, n_kv*d])",
+        "input_shape": ["B", "S", "hidden_size"],
+        "output_shapes": [["B", "S", "n_q*d"], ["B", "S", "n_kv*d"], ["B", "S", "n_kv*d"]],
+        "weights": {"W_qkv": ["n_q*d + 2*n_kv*d", "hidden_size"]},
+        "implementation": "GroupQueryAttention_QKV"
+      },
+      {
+        "step": 2,
+        "op": "reshape_heads",
+        "formula": "Q = Q.view(B, S, H, D).transpose(1,2); K = K.view(B, S, H_kv, D).transpose(1,2); V = V.view(B, S, H_kv, D).transpose(1,2)",
+        "input_shape": ["B", "S", "H*D"],
+        "output_shape": ["B", "H", "S", "D"],
+        "output_layout": "BHSD"
+      },
+      {
+        "step": 3,
+        "op": "rope",
+        "formula": "Q, K = apply_rotary_pos_emb(Q, K, cos_cache, sin_cache)",
+        "input_shape": ["B", "H", "S", "D"],
+        "output_shape": ["B", "H", "S", "D"],
+        "implementation": "apply_rotary_pos_emb"
+      },
+      {
+        "step": 4,
+        "op": "repeat_kv",
+        "formula": "K = repeat_kv(K, num_key_value_groups); V = repeat_kv(V, num_key_value_groups)",
+        "input_shape": ["B", "H_kv", "S", "D"],
+        "output_shape": ["B", "H", "S", "D"]
+      },
+      {
+        "step": 5,
+        "op": "reshape_for_kernel",
+        "formula": "Q = Q.permute(0,1,3,2).reshape(B*H, D, S) / sqrt(D); K = K.permute(0,1,3,2).reshape(B*H, D, S); V = V.reshape(B*H, S, D)",
+        "input_shape": ["B", "H", "S", "D"],
+        "output_shape": ["B*H", "D", "S"],
+        "output_layout": "(B*H)DS for Q,K; (B*H)SD for V"
+      },
+      {
+        "step": 6,
+        "op": "flash_attention_sharded",
+        "formula": "O = FlashAttention_Sharded(Q, K, V, scale=1.0, mask=causal)",
+        "input_shape": ["B*H", "D", "S"],
+        "output_shape": ["B*H", "D", "S"],
+        "kernel_params": {
+          "function": "_flash_fwd_call",
+          "source": "neuronxcc.nki._private_kernels.attention.attention_isa_kernel",
+          "kernel_name": "CausalAttentionMMSoftmaxMMWithoutSwap",
+          "grid": ["nc(logical_nc_config)"],
+          "Q_shape": ["B*H", "D", "S"],
+          "K_shape": ["B*H", "D", "S"],
+          "V_shape": ["B*H", "S", "D"],
+          "out_shape": ["B*H", "D", "S"],
+          "use_dma_transpose": "q_len <= seq_len_threshold_for_cc_tiling",
+          "fused_operations": ["QK^T", "scale", "mask", "softmax", "QK*V"]
+        }
+      },
+      {
+        "step": 7,
+        "op": "reshape_output",
+        "formula": "O = O.reshape(B, H, D, S).permute(0,3,1,2)",
+        "input_shape": ["B*H", "D", "S"],
+        "output_shape": ["B", "S", "H", "D"],
+        "output_layout": "BSHD"
+      },
+      {
+        "step": 8,
+        "op": "output_projection",
+        "formula": "Y = O.reshape(B, S, H*D) @ W_o",
+        "input_shape": ["B", "S", "H*D"],
+        "output_shape": ["B", "S", "hidden_size"],
+        "weights": {"W_o": ["hidden_size", "H*D"]},
+        "implementation": "GroupQueryAttention_O"
+      }
+    ],
+    "special_features": {
+      "learned_sinks": {
+        "enabled": false,
+        "size": null,
+        "shape": null,
+        "usage": "Optional via learned_sinks_size parameter"
+      },
+      "sliding_window": {"enabled": false},
+      "qk_normalization": {"enabled": false},
+      "kv_cache": {"enabled": false}
+    },
+    "source_reference": {
+      "file": "attention_base.py",
+      "class": "NeuronAttentionBase",
+      "method": "perform_prefill",
+      "line_range": [609, 721]
+    }
+  },
+  {
+    "module_id": "nxdi_attention_prefill_flash_unsharded",
+    "nxdi_class": "NeuronAttentionBase",
+    "execution_path": {
+      "stage": "prefill",
+      "method": "perform_prefill",
+      "conditions": {
+        "cp_degree": 1,
+        "flash_attention_strategy": "UNSHARDED_KERNEL",
+        "logical_nc_config": 1,
+        "q_len": ">=4096 OR (>=512 AND attn_kernel_enabled=True)",
+        "attn_kernel_enabled": "!= False"
+      }
+    },
+    "mathematical_operations": [
+      {
+        "step": 1,
+        "op": "qkv_projection",
+        "formula": "Q, K, V = split(X @ W_qkv, [n_q*d, n_kv*d, n_kv*d])",
+        "input_shape": ["B", "S", "hidden_size"],
+        "output_shapes": [["B", "S", "n_q*d"], ["B", "S", "n_kv*d"], ["B", "S", "n_kv*d"]],
+        "weights": {"W_qkv": ["n_q*d + 2*n_kv*d", "hidden_size"]}
+      },
+      {
+        "step": 2,
+        "op": "reshape_heads",
+        "formula": "Q, K, V = move_heads_front(Q, K, V)",
+        "input_shape": ["B", "S", "H*D"],
+        "output_shape": ["B", "H", "S", "D"],
+        "output_layout": "BHSD"
+      },
+      {
+        "step": 3,
+        "op": "rope",
+        "formula": "Q, K = apply_rotary_pos_emb(Q, K, cos, sin)",
+        "input_shape": ["B", "H", "S", "D"],
+        "output_shape": ["B", "H", "S", "D"]
+      },
+      {
+        "step": 4,
+        "op": "repeat_kv",
+        "formula": "K = repeat_kv(K, n_rep); V = repeat_kv(V, n_rep)",
+        "input_shape": ["B", "H_kv", "S", "D"],
+        "output_shape": ["B", "H", "S", "D"]
+      },
+      {
+        "step": 5,
+        "op": "reshape_for_kernel",
+        "formula": "Q = Q.permute(0,1,3,2).reshape(B*H, D, S) / sqrt(D); K = K.permute(0,1,3,2).reshape(B*H, D, S); V = V.reshape(B*H, S, D)",
+        "input_shape": ["B", "H", "S", "D"],
+        "output_shape": ["B*H", "D", "S"]
+      },
+      {
+        "step": 6,
+        "op": "flash_attention_unsharded",
+        "formula": "O = FlashAttention(Q, K, V, scale=1.0)",
+        "input_shape": ["B*H", "D", "S"],
+        "output_shape": ["B*H", "D", "S"],
+        "kernel_params": {
+          "function": "_flash_fwd_call",
+          "source": "neuronxcc.nki._private_kernels.attention.attention_isa_kernel",
+          "kernel_name": "AttentionMMSoftmaxMMWithoutSwap OR CausalAttentionMMSoftmaxMMWithoutSwap",
+          "grid": null,
+          "Q_shape": ["B*H", "D", "S"],
+          "K_shape": ["B*H", "D", "S"],
+          "V_shape": ["B*H", "S", "D"],
+          "out_shape": ["B*H", "D", "S"],
+          "use_dma_transpose": "q_len <= seq_len_threshold_for_cc_tiling"
+        }
+      },
+      {
+        "step": 7,
+        "op": "reshape_output",
+        "formula": "O = O.reshape(B, H, D, S).permute(0,3,1,2)",
+        "input_shape": ["B*H", "D", "S"],
+        "output_shape": ["B", "S", "H", "D"],
+        "output_layout": "BSHD"
+      },
+      {
+        "step": 8,
+        "op": "output_projection",
+        "formula": "Y = O.reshape(B, S, H*D) @ W_o",
+        "input_shape": ["B", "S", "H*D"],
+        "output_shape": ["B", "S", "hidden_size"],
+        "weights": {"W_o": ["hidden_size", "H*D"]}
+      }
+    ],
+    "special_features": {
+      "learned_sinks": {"enabled": false},
+      "sliding_window": {"enabled": false},
+      "qk_normalization": {"enabled": false},
+      "kv_cache": {"enabled": false}
+    },
+    "source_reference": {
+      "file": "attention_base.py",
+      "class": "NeuronAttentionBase",
+      "method": "perform_prefill",
+      "line_range": [609, 721]
+    }
+  },
+  {
+    "module_id": "nxdi_attention_prefill_native",
+    "nxdi_class": "NeuronAttentionBase",
+    "execution_path": {
+      "stage": "prefill",
+      "method": "perform_prefill",
+      "conditions": {
+        "flash_attention_strategy": "NONE",
+        "cp_degree": 1,
+        "attn_kernel_enabled": false
+      }
+    },
+    "mathematical_operations": [
+      {
+        "step": 1,
+        "op": "qkv_projection",
+        "formula": "Q, K, V = split(X @ W_qkv, [n_q*d, n_kv*d, n_kv*d])",
+        "input_shape": ["B", "S", "hidden_size"],
+        "output_shapes": [["B", "S", "n_q*d"], ["B", "S", "n_kv*d"], ["B", "S", "n_kv*d"]],
+        "weights": {"W_qkv": ["n_q*d + 2*n_kv*d", "hidden_size"]}
+      },
+      {
+        "step": 2,
+        "op": "reshape_heads",
+        "formula": "Q = Q.view(B, S, H, D).transpose(1,2); K = K.view(B, S, H_kv, D).transpose(1,2); V = V.view(B, S, H_kv, D).transpose(1,2)",
+        "input_shape": ["B", "S", "H*D"],
+        "output_shape": ["B", "H", "S", "D"],
+        "output_layout": "BHSD"
+      },
+      {
+        "step": 3,
+        "op": "rope",
+        "formula": "Q, K = apply_rotary_pos_emb(Q, K, cos_cache, sin_cache)",
+        "input_shape": ["B", "H", "S", "D"],
+        "output_shape": ["B", "H", "S", "D"]
+      },
+      {
+        "step": 4,
+        "op": "repeat_kv",
+        "formula": "K = repeat_kv(K, num_key_value_groups); V = repeat_kv(V, num_key_value_groups)",
+        "input_shape": ["B", "H_kv", "S", "D"],
+        "output_shape": ["B", "H", "S", "D"]
+      },
+      {
+        "step": 5,
+        "op": "attention_scores",
+        "formula": "QK = (Q @ K^T) / sqrt(D)",
+        "input_shape": ["B", "H", "S", "D"],
+        "output_shape": ["B", "H", "S", "S"]
+      },
+      {
+        "step": 6,
+        "op": "apply_mask",
+        "formula": "QK = where(mask, QK, -inf)",
+        "input_shape": ["B", "H", "S", "S"],
+        "output_shape": ["B", "H", "S", "S"]
+      },
+      {
+        "step": 7,
+        "op": "learned_sinks_concat",
+        "formula": "QK = cat([QK, sinks.expand(B, H, S, 1)], dim=-1) if learned_sinks_size > 0",
+        "input_shape": ["B", "H", "S", "S"],
+        "output_shape": ["B", "H", "S", "S+1"],
+        "note": "Optional step"
+      },
+      {
+        "step": 8,
+        "op": "softmax",
+        "formula": "attn_weights = softmax(QK, dim=-1)",
+        "input_shape": ["B", "H", "S", "S+k"],
+        "output_shape": ["B", "H", "S", "S+k"],
+        "dtype": "float32"
+      },
+      {
+        "step": 9,
+        "op": "learned_sinks_remove",
+        "formula": "attn_weights = attn_weights[..., :-1] if learned_sinks_size > 0",
+        "input_shape": ["B", "H", "S", "S+1"],
+        "output_shape": ["B", "H", "S", "S"],
+        "note": "Optional step"
+      },
+      {
+        "step": 10,
+        "op": "attention_output",
+        "formula": "O = attn_weights @ V",
+        "input_shape": ["B", "H", "S", "D"],
+        "output_shape": ["B", "H", "S", "D"]
+      },
+      {
+        "step": 11,
+        "op": "transpose",
+        "formula": "O = O.transpose(1,2).contiguous()",
+        "input_shape": ["B", "H", "S", "D"],
+        "output_shape": ["B", "S", "H", "D"],
+        "output_layout": "BSHD"
+      },
+      {
+        "step": 12,
+        "op": "output_projection",
+        "formula": "Y = O.reshape(B, S, H*D) @ W_o",
+        "input_shape": ["B", "S", "H*D"],
+        "output_shape": ["B", "S", "hidden_size"],
+        "weights": {"W_o": ["hidden_size", "H*D"]}
+      }
+    ],
+    "special_features": {
+      "learned_sinks": {
+        "enabled": true,
+        "size": "learned_sinks_size",
+        "shape": ["H"],
+        "usage": "Concatenated to attention scores before softmax, removed after"
+      },
+      "sliding_window": {"enabled": false},
+      "qk_normalization": {"enabled": false},
+      "kv_cache": {"enabled": false}
+    },
+    "source_reference": {
+      "file": "attention_base.py",
+      "class": "NeuronAttentionBase",
+      "method": "perform_prefill",
+      "line_range": [705, 721]
+    }
+  },
+  {
+    "module_id": "nxdi_attention_tokengen_block_nki",
+    "nxdi_class": "NeuronAttentionBase",
+    "execution_path": {
+      "stage": "token_generation",
+      "method": "attention_block_tokengen_nki_kernel",
+      "conditions": {
+        "attn_block_tkg_nki_kernel_enabled": true,
+        "is_token_gen": true,
+        "q_len": "<128"
+      }
+    },
+    "mathematical_operations": [
+      {
+        "step": 1,
+        "op": "prepare_rope_coefficients",
+        "formula": "cos, sin = rotary_emb(hidden_states, position_ids); cos = cos[..., :D/2].permute(2,0,1); sin = sin[..., :D/2].permute(2,0,1)",
+        "input_shape": ["B", "S", "H_hidden"],
+        "output_shape": ["D/2", "B", "S"],
+        "implementation": "rotary_emb"
+      },
+      {
+        "step": 2,
+        "op": "prepare_masks",
+        "formula": "attention_mask = attention_mask.expand(-1, H, -1, -1); active_mask = active_mask.expand(-1, H, -1, -1)",
+        "input_shape": ["B", "1", "S", "S_prior"],
+        "output_shape": ["B", "H", "S", "S_prior"]
+      },
+      {
+        "step": 3,
+        "op": "fused_attention_block",
+        "formula": "O, K_new, V_new = AttnBlockKernel(X, W_qkv, W_gamma, eps, cos, sin, W_out, K_cache, V_cache, mask_cache, mask_active, pos_ids, update_cache, block_table, K_transposed, fused_rmsnorm, skip_rope, rope_impl, qk_norm, qk_norm_eps, bias_out, bias_qkv, cascaded_attn, sink)",
+        "input_shape": ["B", "S", "H_hidden"],
+        "output_shape": ["D", "B", "H*S"],
+        "kernel_params": {
+          "function": "llama3_nki_attention_block_token_gen_kernel",
+          "source": "neuronxcc.nki._pre_prod_kernels.attention_token_gen",
+          "kernel_name": null,
+          "grid": ["nc(logical_nc_config)"],
+          "Q_shape": null,
+          "K_shape": null,
+          "V_shape": null,
+          "out_shape": ["D", "B", "H*S"],
+          "layout_note": "Fused QKV projection, RMSNorm, RoPE, attention, output projection",
+          "fused_operations": ["rmsnorm", "qkv_proj", "rope", "qk_norm", "attention", "kv_cache_update", "output_proj"],
+          "K_cache_transposed": "k_cache_transposed",
+          "fused_rmsnorm": true,
+          "skip_rope": false,
+          "rope_first_second_half_impl": true,
+          "qk_norm": "use_qk_norm",
+          "update_cache": "update_kv_per_layer"
+        },
+        "implementation": "llama3_nki_attention_block_token_gen_kernel"
+      },
+      {
+        "step": 4,
+        "op": "reshape_output",
+        "formula": "O = O.reshape(B, S, H_hidden)",
+        "input_shape": ["D", "B", "H*S"],
+        "output_shape": ["B", "S", "H_hidden"]
+      },
+      {
+        "step": 5,
+        "op": "all_reduce",
+        "formula": "O = reduce_scatter(O, dim=1) if SP else reduce(O)",
+        "input_shape": ["B", "S", "H_hidden"],
+        "output_shape": ["B", "S", "H_hidden"],
+        "implementation": "reduce_scatter_to_sequence_parallel_region OR reduce_from_tensor_model_parallel_region"
+      },
+      {
+        "step": 6,
+        "op": "reshape_kv",
+        "formula": "K = K.permute(1,0,2).unsqueeze(1) if K_transposed else K.permute(1,2,0).unsqueeze(1); V = V.unsqueeze(1)",
+        "input_shape": ["D", "B", "S"],
+        "output_shape": ["B", "1", "D", "S"],
+        "output_layout": "B,1,D,S for K (transposed); B,1,S,D for V",
+        "note": "Only if update_cache not in kernel"
+      }
+    ],
+    "special_features": {
+      "learned_sinks": {
+        "enabled": true,
+        "size": "learned_sinks_size",
+        "shape": ["H"],
+        "usage": "Passed to kernel as sink parameter"
+      },
+      "sliding_window": {"enabled": false},
+      "qk_normalization": {
+        "enabled": true,
+        "placement": null,
+        "eps": "rms_norm_eps"
+      },
+      "kv_cache": {
+        "enabled": true,
+        "K_cache_shape": ["B", "H_kv", "D", "S_max"],
+        "V_cache_shape": ["B", "H_kv", "S_max", "D"],
+        "K_transposed": true,
+        "update_in_kernel": true
+      }
+    },
+    "source_reference": {
+      "file": "attention_base.py",
+      "class": "NeuronAttentionBase",
+      "method": "attention_block_tokengen_nki_kernel",
+      "line_range": [1304, 1502]
+    }
+  },
+  {
+    "module_id": "nxdi_attention_tokengen_builtin_rope",
+    "nxdi_class": "NeuronAttentionBase",
+    "execution_path": {
+      "stage": "token_generation",
+      "method": "attention_tokengen_kernel_builtin",
+      "conditions": {
+        "attn_tkg_builtin_kernel_enabled": true,
+        "attn_block_tkg_nki_kernel_enabled": false,
+        "is_token_gen": true
+      }
+    },
+    "mathematical_operations": [
+      {
+        "step": 1,
+        "op": "qkv_projection",
+        "formula": "Q, K, V = split(X @ W_qkv, [n_q*d, n_kv*d, n_kv*d])",
+        "input_shape": ["B", "S", "H_hidden"],
+        "output_shapes": [["B", "S", "n_q*d"], ["B", "S", "n_kv*d"], ["B", "S", "n_kv*d"]],
+        "weights": {"W_qkv": ["n_q*d + 2*n_kv*d", "H_hidden"]},
+        "note": "RoPE not applied yet"
+      },
+      {
+        "step": 2,
+        "op": "reshape_heads",
+        "formula": "Q = Q.view(B, S, H, D).transpose(1,2); K = K.view(B, S, H_kv, D).transpose(1,2); V = V.view(B, S, H_kv, D).transpose(1,2)",
+        "input_shape": ["B", "S", "H*D"],
+        "output_shape": ["B", "H", "S", "D"],
+        "output_layout": "BHSD"
+      },
+      {
+        "step": 3,
+        "op": "prepare_masks",
+        "formula": "active_mask = active_mask.permute(3,0,1,2); pos_id = position_ids[:,0].unsqueeze(-1)",
+        "input_shape": ["B", "H", "S", "S"],
+        "output_shape": ["S", "B", "H", "S"],
+        "note": "Upper triangular expected"
+      },
+      {
+        "step": 4,
+        "op": "builtin_token_gen_kernel",
+        "formula": "O, K_rotated = AttnTkgBuiltin(Q, K, V, K_prior, V_prior, pos_id, active_mask, inv_freqs, rope_pos_ids)",
+        "input_shape": ["B", "H", "S", "D"],
+        "output_shape": ["B", "H", "D", "S"],
+        "kernel_params": {
+          "function": "_attn_builtin_token_gen_call",
+          "source": "neuronxcc.nki._private_kernels.attention.attention_tkg_fwd_isa_kernel",
+          "kernel_name": "AttentionTkgFwd",
+          "grid": ["nc(logical_nc_config)"],
+          "Q_shape": ["B", "H", "S", "D"],
+          "K_shape": ["B", "H_kv", "S", "D"],
+          "V_shape": ["B", "H_kv", "S", "D"],
+          "out_shape": ["B", "H", "D", "S"],
+          "fused_operations": ["rope", "attention"],
+          "fuse_rope": true,
+          "strided_mm1": true,
+          "use_dma_tp": true,
+          "use_pos_id": true,
+          "curr_sprior": "s_prior",
+          "full_sprior": "s_prior_full",
+          "tp_k_prior": "not k_cache_transposed"
+        },
+        "implementation": "attention_tkg_fwd_isa_kernel"
+      },
+      {
+        "step": 5,
+        "op": "permute_outputs",
+        "formula": "O = O.permute(0,1,3,2); K = K.permute(0,1,3,2)",
+        "input_shape": ["B", "H", "D", "S"],
+        "output_shape": ["B", "H", "S", "D"],
+        "output_layout": "BHSD"
+      },
+      {
+        "step": 6,
+        "op": "transpose",
+        "formula": "O = O.transpose(1,2).contiguous()",
+        "input_shape": ["B", "H", "S", "D"],
+        "output_shape": ["B", "S", "H", "D"],
+        "output_layout": "BSHD"
+      },
+      {
+        "step": 7,
+        "op": "output_projection",
+        "formula": "Y = O.reshape(B, S, H*D) @ W_o",
+        "input_shape": ["B", "S", "H*D"],
+        "output_shape": ["B", "S", "H_hidden"],
+        "weights": {"W_o": ["H_hidden", "H*D"]}
+      }
+    ],
+    "special_features": {
+      "learned_sinks": {"enabled": false},
+      "sliding_window": {"enabled": false},
+      "qk_normalization": {"enabled": false},
+      "kv_cache": {
+        "enabled": true,
+        "K_cache_shape": ["B", "H_kv", "S_max", "D"],
+        "V_cache_shape": ["B", "H_kv", "S_max", "D"],
+        "K_transposed": false,
+        "update_in_kernel": false
+      }
+    },
+    "source_reference": {
+      "file": "attention_base.py",
+      "class": "NeuronAttentionBase",
+      "method": "attention_tokengen_kernel_builtin",
+      "line_range": [1226, 1302]
+    }
+  },
+  {
+    "module_id": "nxdi_attention_tokengen_nki",
+    "nxdi_class": "NeuronAttentionBase",
+    "execution_path": {
+      "stage": "token_generation",
+      "method": "attention_tokengen_kernel_nki",
+      "conditions": {
+        "attn_tkg_nki_kernel_enabled": true,
+        "attn_block_tkg_nki_kernel_enabled": false,
+        "attn_tkg_builtin_kernel_enabled": false,
+        "is_token_gen": true
+      }
+    },
+    "mathematical_operations": [
+      {
+        "step": 1,
+        "op": "qkv_projection",
+        "formula": "Q, K, V = split(X @ W_qkv, [n_q*d, n_kv*d, n_kv*d])",
+        "input_shape": ["B", "S", "H_hidden"],
+        "output_shapes": [["B", "S", "n_q*d"], ["B", "S", "n_kv*d"], ["B", "S", "n_kv*d"]],
+        "weights": {"W_qkv": ["n_q*d + 2*n_kv*d", "H_hidden"]}
+      },
+      {
+        "step": 2,
+        "op": "reshape_heads",
+        "formula": "Q = Q.view(B, S, H, D).transpose(1,2); K = K.view(B, S, H_kv, D).transpose(1,2); V = V.view(B, S, H_kv, D).transpose(1,2)",
+        "input_shape": ["B", "S", "H*D"],
+        "output_shape": ["B", "H", "S", "D"],
+        "output_layout": "BHSD"
+      },
+      {
+        "step": 3,
+        "op": "rope",
+        "formula": "Q, K = apply_rotary_pos_emb(Q, K, cos, sin)",
+        "input_shape": ["B", "H", "S", "D"],
+        "output_shape": ["B", "H", "S", "D"]
+      },
+      {
+        "step": 4,
+        "op": "reshape_for_kernel",
+        "formula": "Q = Q.permute(0,3,1,2) / sqrt(D); K = K.permute(0,1,3,2).reshape(B, D, S); V = V.reshape(B, S, D)",
+        "input_shape": ["B", "H", "S", "D"],
+        "output_shape": ["B", "D", "H", "S"],
+        "output_layout": "BDHS for Q; BDS for K,V",
+        "note": "Assumes H_kv=1"
+      },
+      {
+        "step": 5,
+        "op": "squeeze_kv_cache",
+        "formula": "K_prior = K_prior.squeeze(1); V_prior = V_prior.squeeze(1)",
+        "input_shape": ["B", "1", "S_max", "D"],
+        "output_shape": ["B", "S_max", "D"]
+      },
+      {
+        "step": 6,
+        "op": "expand_mask",
+        "formula": "attention_mask = attention_mask.expand(-1, H, -1, -1)",
+        "input_shape": ["B", "1", "S", "S_prior"],
+        "output_shape": ["B", "H", "S", "S_prior"]
+      },
+      {
+        "step": 7,
+        "op": "token_gen_nki_kernel",
+        "formula": "O = AttnTkgNKI(Q, K, V, K_prior, V_prior, mask_cache, mask_active, K_transposed)",
+        "input_shape": ["B", "D", "H", "S"],
+        "output_shape": ["D", "B*H*S"],
+        "kernel_params": {
+          "function": "attention_token_gen_kernel",
+          "source": "neuronxcc.nki._pre_prod_kernels.attention_token_gen",
+          "kernel_name": null,
+          "grid": ["nc(logical_nc_config)"],
+          "Q_shape": ["B", "D", "H", "S"],
+          "K_shape": ["B", "D", "S"],
+          "V_shape": ["B", "S", "D"],
+          "out_shape": ["D", "B*H*S"],
+          "K_cache_transposed": "k_cache_transposed"
+        },
+        "implementation": "attention_token_gen_kernel"
+      },
+      {
+        "step": 8,
+        "op": "reshape_output",
+        "formula": "O = O.permute(1,0).reshape(B, H, S, D)",
+        "input_shape": ["D", "B*H*S"],
+        "output_shape": ["B", "H", "S", "D"],
+        "output_layout": "BHSD"
+      },
+      {
+        "step": 9,
+        "op": "transpose",
+        "formula": "O = O.transpose(1,2).contiguous()",
+        "input_shape": ["B", "H", "S", "D"],
+        "output_shape": ["B", "S", "H", "D"],
+        "output_layout": "BSHD"
+      },
+      {
+        "step": 10,
+        "op": "output_projection",
+        "formula": "Y = O.reshape(B, S, H*D) @ W_o",
+        "input_shape": ["B", "S", "H*D"],
+        "output_shape": ["B", "S", "H_hidden"],
+        "weights": {"W_o": ["H_hidden", "H*D"]}
+      }
+    ],
+    "special_features": {
+      "learned_sinks": {"enabled": false},
+      "sliding_window": {"enabled": false},
+      "qk_normalization": {"enabled": false},
+      "kv_cache": {
+        "enabled": true,
+        "K_cache_shape": ["B", "H_kv", "S_max", "D"],
+        "V_cache_shape": ["B", "H_kv", "S_max", "D"],
+        "K_transposed": "k_cache_transposed",
+        "update_in_kernel": false
+      }
+    },
+    "source_reference": {
+      "file": "attention_base.py",
+      "class": "NeuronAttentionBase",
+      "method": "attention_tokengen_kernel_nki",
+      "line_range": [1162, 1224]
+    }
+  },
+  {
+    "module_id": "nxdi_attention_tokengen_native",
+    "nxdi_class": "NeuronAttentionBase",
+    "execution_path": {
+      "stage": "token_generation",
+      "method": "compute_for_token_gen",
+      "conditions": {
+        "attn_tkg_nki_kernel_enabled": false,
+        "attn_block_tkg_nki_kernel_enabled": false,
+        "attn_tkg_builtin_kernel_enabled": false,
+        "flash_decoding_enabled": false,
+        "is_prefix_caching": false,
+        "is_chunked_prefill": false,
+        "is_token_gen": true
+      }
+    },
+    "mathematical_operations": [
+      {
+        "step": 1,
+        "op": "qkv_projection",
+        "formula": "Q, K, V = split(X @ W_qkv, [n_q*d, n_kv*d, n_kv*d])",
+        "input_shape": ["B", "S", "H_hidden"],
+        "output_shapes": [["B", "S", "n_q*d"], ["B", "S", "n_kv*d"], ["B", "S", "n_kv*d"]],
+        "weights": {"W_qkv": ["n_q*d + 2*n_kv*d", "H_hidden"]}
+      },
+      {
+        "step": 2,
+        "op": "reshape_heads",
+        "formula": "Q = Q.view(B, S, H, D).transpose(1,2); K = K.view(B, S, H_kv, D).transpose(1,2); V = V.view(B, S, H_kv, D).transpose(1,2)",
+        "input_shape": ["B", "S", "H*D"],
+        "output_shape": ["B", "H", "S", "D"],
+        "output_layout": "BHSD"
+      },
+      {
+        "step": 3,
+        "op": "rope",
+        "formula": "Q, K = apply_rotary_pos_emb(Q, K, cos, sin)",
+        "input_shape": ["B", "H", "S", "D"],
+        "output_shape": ["B", "H", "S", "D"]
+      },
+      {
+        "step": 4,
+        "op": "repeat_kv_prior",
+        "formula": "K_prior = repeat_kv(K_prior, n_rep); V_prior = repeat_kv(V_prior, n_rep)",
+        "input_shape": ["B", "H_kv", "S_max", "D"],
+        "output_shape": ["B", "H", "S_max", "D"]
+      },
+      {
+        "step": 5,
+        "op": "transpose_k_cache",
+        "formula": "K_prior = K_prior.transpose(2,3) if not k_cache_transposed else K_prior",
+        "input_shape": ["B", "H", "S_max", "D"],
+        "output_shape": ["B", "H", "D", "S_max"]
+      },
+      {
+        "step": 6,
+        "op": "prior_scores",
+        "formula": "prior_scores = (Q @ K_prior) / sqrt(D)",
+        "input_shape": ["B", "H", "S", "D"],
+        "output_shape": ["B", "H", "S", "S_max"]
+      },
+      {
+        "step": 7,
+        "op": "apply_prior_mask",
+        "formula": "prior_scores = where(attention_mask, prior_scores, -inf)",
+        "input_shape": ["B", "H", "S", "S_max"],
+        "output_shape": ["B", "H", "S", "S_max"],
+        "dtype": "float32"
+      },
+      {
+        "step": 8,
+        "op": "repeat_kv_active",
+        "formula": "K = repeat_kv(K, n_rep); V = repeat_kv(V, n_rep)",
+        "input_shape": ["B", "H_kv", "S", "D"],
+        "output_shape": ["B", "H", "S", "D"]
+      },
+      {
+        "step": 9,
+        "op": "active_scores",
+        "formula": "active_scores = (Q @ K^T) / sqrt(D)",
+        "input_shape": ["B", "H", "S", "D"],
+        "output_shape": ["B", "H", "S", "S"],
+        "dtype": "float32"
+      },
+      {
+        "step": 10,
+        "op": "learned_sinks_concat",
+        "formula": "prior_scores = cat([prior_scores, sinks.expand(B, H, S, 1)], dim=-1) if learned_sinks_size > 0",
+        "input_shape": ["B", "H", "S", "S_max"],
+        "output_shape": ["B", "H", "S", "S_max+1"],
+        "note": "Optional"
+      },
+      {
+        "step": 11,
+        "op": "manual_softmax",
+        "formula": "softmax_prior, softmax_active = manual_softmax(prior_scores, active_scores, is_speculation=False)",
+        "input_shape": ["B", "H", "S", "S_max+k"],
+        "output_shape": ["B", "H", "S", "S_max+k"],
+        "implementation": "manual_softmax"
+      },
+      {
+        "step": 12,
+        "op": "learned_sinks_remove",
+        "formula": "softmax_prior = softmax_prior[..., :-1] if learned_sinks_size > 0",
+        "input_shape": ["B", "H", "S", "S_max+1"],
+        "output_shape": ["B", "H", "S", "S_max"],
+        "note": "Optional"
+      },
+      {
+        "step": 13,
+        "op": "attention_output",
+        "formula": "O = (softmax_prior @ V_prior) + (softmax_active @ V)",
+        "input_shape": ["B", "H", "S", "D"],
+        "output_shape": ["B", "H", "S", "D"]
+      },
+      {
+        "step": 14,
+        "op": "transpose",
+        "formula": "O = O.transpose(1,2).contiguous()",
+        "input_shape": ["B", "H", "S", "D"],
+        "output_shape": ["B", "S", "H", "D"],
+        "output_layout": "BSHD"
+      },
+      {
+        "step": 15,
+        "op": "output_projection",
+        "formula": "Y = O.reshape(B, S, H*D) @ W_o",
+        "input_shape": ["B", "S", "H*D"],
+        "output_shape": ["B", "S", "H_hidden"],
+        "weights": {"W_o": ["H_hidden", "H*D"]}
+      }
+    ],
+    "special_features": {
+      "learned_sinks": {
+        "enabled": true,
+        "size": "learned_sinks_size",
+        "shape": ["H"],
+        "usage": "Concatenated to prior_scores before softmax"
+      },
+      "sliding_window": {"enabled": false},
+      "qk_normalization": {"enabled": false},
+      "kv_cache": {
+        "enabled": true,
+        "K_cache_shape": ["B", "H_kv", "S_max", "D"],
+        "V_cache_shape": ["B", "H_kv", "S_max", "D"],
+        "K_transposed": "k_cache_transposed",
+        "update_in_kernel": false
+      }
+    },
+    "source_reference": {
+      "file": "attention_base.py",
+      "class": "NeuronAttentionBase",
+      "method": "compute_for_token_gen",
+      "line_range": [1596, 1670]
+    }
+  },
+  {
+    "module_id": "nxdi_attention_prefill_sliding_window_nki",
+    "nxdi_class": "NeuronAttentionBase",
+    "execution_path": {
+      "stage": "prefill",
+      "method": "perform_prefill_windowed_attn",
+      "conditions": {
+        "sliding_window": "not null",
+        "flash_attention_strategy": "SLIDING_WINDOW_KERNEL",
+        "q_len": ">=MIN_SLIDING_WINDOW_SEQ_TILE_SIZE",
+        "learned_sinks_size": "null or 0"
+      }
+    },
+    "mathematical_operations": [
+      {
+        "step": 1,
+        "op": "qkv_projection",
+        "formula": "Q, K, V = split(X @ W_qkv, [n_q*d, n_kv*d, n_kv*d])",
+        "input_shape": ["B", "S", "H_hidden"],
+        "output_shapes": [["B", "S", "n_q*d"], ["B", "S", "n_kv*d"], ["B", "S", "n_kv*d"]],
+        "weights": {"W_qkv": ["n_q*d + 2*n_kv*d", "H_hidden"]}
+      },
+      {
+        "step": 2,
+        "op": "reshape_heads",
+        "formula": "Q = Q.view(B, S, H, D).transpose(1,2); K = K.view(B, S, H_kv, D).transpose(1,2); V = V.view(B, S, H_kv, D).transpose(1,2)",
+        "input_shape": ["B", "S", "H*D"],
+        "output_shape": ["B", "H", "S", "D"],
+        "output_layout": "BHSD"
+      },
+      {
+        "step": 3,
+        "op": "rope",
+        "formula": "Q, K = apply_rotary_pos_emb(Q, K, cos, sin)",
+        "input_shape": ["B", "H", "S", "D"],
+        "output_shape": ["B", "H", "S", "D"]
+      },
+      {
+        "step": 4,
+        "op": "repeat_kv",
+        "formula": "K = repeat_kv(K, n_rep); V = repeat_kv(V, n_rep)",
+        "input_shape": ["B", "H_kv", "S", "D"],
+        "output_shape": ["B", "H", "S", "D"]
+      },
+      {
+        "step": 5,
+        "op": "permute_qk",
+        "formula": "Q = Q.permute(0,1,3,2); K = K.permute(0,1,3,2)",
+        "input_shape": ["B", "H", "S", "D"],
+        "output_shape": ["B", "H", "D", "S"],
+        "output_layout": "BHDS"
+      },
+      {
+        "step": 6,
+        "op": "create_flash_config",
+        "formula": "config = FlashConfig() if S >= DEFAULT_TILE_SIZE else FlashConfig(seq_tile_size=MIN_TILE_SIZE)",
+        "input_shape": null,
+        "output_shape": null
+      },
+      {
+        "step": 7,
+        "op": "flash_fwd_sliding_window",
+        "formula": "O = flash_fwd(Q, K, V, window_size=(window-1, -1), config=config)",
+        "input_shape": ["B", "H", "D", "S"],
+        "output_shape": ["B", "H", "S", "D"],
+        "kernel_params": {
+          "function": "flash_fwd",
+          "source": "neuronx_distributed_inference.modules.sliding_window.attention",
+          "kernel_name": null,
+          "grid": ["B", "H"],
+          "Q_shape": ["B", "H", "D", "S"],
+          "K_shape": ["B", "H", "D", "S"],
+          "V_shape": ["B", "H", "S", "D"],
+          "out_shape": ["B", "H", "S", "D"],
+          "window_size": ["sliding_window-1", "-1"],
+          "config": "FlashConfig"
+        },
+        "implementation": "flash_fwd"
+      },
+      {
+        "step": 8,
+        "op": "transpose",
+        "formula": "O = O.transpose(1,2).contiguous()",
+        "input_shape": ["B", "H", "S", "D"],
+        "output_shape": ["B", "S", "H", "D"],
+        "output_layout": "BSHD"
+      },
+      {
+        "step": 9,
+        "op": "output_projection",
+        "formula": "Y = O.reshape(B, S, H*D) @ W_o",
+        "input_shape": ["B", "S", "H*D"],
+        "output_shape": ["B", "S", "H_hidden"],
+        "weights": {"W_o": ["H_hidden", "H*D"]}
+      }
+    ],
+    "special_features": {
+      "learned_sinks": {
+        "enabled": false,
+        "size": null,
+        "shape": null,
+        "usage": "Not supported with flash_fwd NKI kernel"
+      },
+      "sliding_window": {
+        "enabled": true,
+        "window_size": "sliding_window",
+        "mask_formula": "(window_size-1, -1)",
+        "note": "Uses flash_fwd NKI kernel"
+      },
+      "qk_normalization": {"enabled": false},
+      "kv_cache": {"enabled": false}
+    },
+    "source_reference": {
+      "file": "attention_base.py",
+      "class": "NeuronAttentionBase",
+      "method": "perform_prefill_windowed_attn",
+      "line_range": [964, 1000]
+    }
+  },
+  {
+    "module_id": "nxdi_attention_prefill_block_cte_nki",
+    "nxdi_class": "NeuronAttentionBase",
+    "execution_path": {
+      "stage": "prefill",
+      "method": "attention_block_cte_nki_kernel",
+      "conditions": {
+        "attn_block_cte_nki_kernel_enabled": true,
+        "is_token_gen": false,
+        "is_prefix_caching": false,
+        "sequence_parallel_enabled": false
+      }
+    },
+    "mathematical_operations": [
+      {
+        "step": 1,
+        "op": "prepare_rope_coefficients",
+        "formula": "cos, sin = rotary_emb(X, position_ids); cos = cos[..., :D/2].permute(2,0,1); sin = sin[..., :D/2].permute(2,0,1)",
+        "input_shape": ["B", "S", "H_hidden"],
+        "output_shape": ["D/2", "B", "S"]
+      },
+      {
+        "step": 2,
+        "op": "initialize_outputs",
+        "formula": "O = zeros(D, B, H*S); residual = zeros(B, S, H_hidden) if residual is None",
+        "input_shape": null,
+        "output_shape": ["D", "B", "H*S"]
+      },
+      {
+        "step": 3,
+        "op": "fused_attention_block_cte",
+        "formula": "O, K, V, residual = AttnBlockCTE(X, W_qkv, W_gamma, None, None, residual, sin, cos, W_out, d_head, k_cache_transposed)",
+        "input_shape": ["B", "S", "H_hidden"],
+        "output_shape": ["D", "B", "H*S"],
+        "kernel_params": {
+          "function": "llama3_nki_attention_block_cte_kernel",
+          "source": "neuronxcc.nki._private_kernels.attention_cte",
+          "kernel_name": null,
+          "grid": ["nc(logical_nc_config)"],
+          "Q_shape": null,
+          "K_shape": null,
+          "V_shape": null,
+          "out_shape": ["D", "B", "H*S"],
+          "layout_note": "Fused QKV projection, RMSNorm, RoPE, attention, output projection",
+          "fused_operations": ["rmsnorm", "qkv_proj", "rope", "attention", "output_proj"],
+          "d_head": "head_dim",
+          "k_cache_transposed": "k_cache_transposed"
+        },
+        "implementation": "llama3_nki_attention_block_cte_kernel"
+      },
+      {
+        "step": 4,
+        "op": "reshape_output",
+        "formula": "O = O.reshape(B, S, H_hidden)",
+        "input_shape": ["D", "B", "H*S"],
+        "output_shape": ["B", "S", "H_hidden"]
+      },
+      {
+        "step": 5,
+        "op": "all_reduce",
+        "formula": "O = reduce_from_tensor_model_parallel_region(O, tp_group)",
+        "input_shape": ["B", "S", "H_hidden"],
+        "output_shape": ["B", "S", "H_hidden"],
+        "implementation": "reduce_from_tensor_model_parallel_region"
+      },
+      {
+        "step": 6,
+        "op": "add_kv_head_dim",
+        "formula": "K = K.unsqueeze(1); V = V.unsqueeze(1)",
+        "input_shape": ["B", "S", "D"],
+        "output_shape": ["B", "1", "S", "D"]
+      }
+    ],
+    "special_features": {
+      "learned_sinks": {"enabled": false},
+      "sliding_window": {"enabled": false},
+      "qk_normalization": {"enabled": false},
+      "kv_cache": {
+        "enabled": true,
+        "K_cache_shape": ["B", "1", "S", "D"],
+        "V_cache_shape": ["B", "1", "S", "D"],
+        "K_transposed": "k_cache_transposed",
+        "update_in_kernel": false
+      }
+    },
+    "source_reference": {
+      "file": "attention_base.py",
+      "class": "NeuronAttentionBase",
+      "method": "attention_block_cte_nki_kernel",
+      "line_range": [1504, 1594]
+    }
+  }
+]
