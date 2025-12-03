@@ -311,6 +311,7 @@ class MLPBlock(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         t = self.norm(x)
+        t = x
         g = self.gate(t)
         experts = torch.topk(g, k=self.experts_per_token, dim=-1, sorted=True)
         expert_weights = torch.nn.functional.softmax(experts.values, dim=1)
@@ -333,7 +334,7 @@ class MLPBlock(torch.nn.Module):
         # Weighted sum of experts
         t = torch.einsum("bec,be->bc", t, expert_weights)
 
-        return x + t
+        return t
 
 
 class TransformerBlock(torch.nn.Module):
