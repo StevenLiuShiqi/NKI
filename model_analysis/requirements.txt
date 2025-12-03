@@ -1,0 +1,4 @@
+hf_transfer
+safetensors
+torch
+transformers

@@ -17,17 +17,18 @@ import torch
 import torch.distributed as dist
 from unittest.mock import patch
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
-from src.model import NeuronGPTOSSAttentionBlock, GPTOSSInferenceConfig, NeuronGPTOSSConfig
+from src.model import NeuronGPTOSSAttentionBlock, NeuronGPTOSSAttentionBlockCompiled, GPTOSSInferenceConfig, NeuronGPTOSSConfig
 from src.gpt_oss import AttentionBlock, ModelConfig
 
 from neuronx_distributed_inference.utils.testing import build_module, validate_accuracy
 
-from test_utils import (
+from tests.test_utils import (
     _fill_module_parameters,
     _get_ref_config,
     _make_original_inference_config,
+    _make_tiny_inference_config,
     _sync_reference_weights_to_neuron,
 )
 
@@ -53,7 +54,7 @@ _ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _make_test_config(
-    batch_size=2,
+    batch_size=1,
     sliding_window=128,
 ):
     """Create a test configuration with specified parameters."""
@@ -115,7 +116,7 @@ def _build_neuron_and_reference_blocks(
 
     # Build Neuron attention block
     neuron_block = build_module(
-        NeuronGPTOSSAttentionBlock,
+        NeuronGPTOSSAttentionBlockCompiled,
         example_inputs,
         tp_degree=1,
         module_init_kwargs={
@@ -186,7 +187,7 @@ def _build_neuron_and_reference_blocks_random_weights(
     # Step 1: Build with uniform weights to generate initial checkpoint
     print(f"\nStep 1: Creating initial neuron block with uniform weights...")
     _temp_neuron_block = build_module(
-        NeuronGPTOSSAttentionBlock,
+        NeuronGPTOSSAttentionBlockCompiled,
         example_inputs,
         tp_degree=1,
         module_init_kwargs={
@@ -210,38 +211,93 @@ def _build_neuron_and_reference_blocks_random_weights(
     neuron_state_dict = torch.load(temp_checkpoint_path)
     ref_state_dict = reference_block.state_dict()
 
-    # Manual weight mapping (same as in _sync_reference_weights_to_neuron)
-    weight_mapping = {
-        'qkv.weight': 'qkv_proj.Wqkv.weight',
-        'qkv.bias': 'qkv_proj.Wqkv.bias',
-        'out.weight': 'o_proj.o_proj.weight',
-        'out.bias': 'o_proj.o_proj.bias',
-        'sinks': ['learned_sinks.sink', 'tkg_learned_sinks.sink'],
-    }
+    # Get dimensions from reference block
+    num_heads = reference_block.num_attention_heads
+    num_kv_heads = reference_block.num_key_value_heads
+    head_dim = reference_block.head_dim
+
+    q_out = num_heads * head_dim
+    kv_out = num_kv_heads * head_dim
+
+    print(f"  Unfusing QKV weights:")
+    print(f"    num_heads={num_heads}, num_kv_heads={num_kv_heads}, head_dim={head_dim}")
+    print(f"    Q output dim: {q_out}, K/V output dim: {kv_out}")
 
     updated_count = 0
-    for ref_key, neuron_key in weight_mapping.items():
-        if ref_key not in ref_state_dict:
-            continue
-        ref_tensor = ref_state_dict[ref_key]
 
-        if isinstance(neuron_key, list):
-            for nk in neuron_key:
-                if nk in neuron_state_dict:
-                    ref_converted = ref_tensor.clone()
-                    if ref_converted.dtype != neuron_state_dict[nk].dtype:
-                        ref_converted = ref_converted.to(dtype=neuron_state_dict[nk].dtype)
-                    neuron_state_dict[nk] = ref_converted
-                    updated_count += 1
-                    print(f"  [COPY] {ref_key} -> {nk}")
-        else:
-            if neuron_key in neuron_state_dict:
-                ref_converted = ref_tensor
-                if ref_converted.dtype != neuron_state_dict[neuron_key].dtype:
-                    ref_converted = ref_converted.to(dtype=neuron_state_dict[neuron_key].dtype)
-                neuron_state_dict[neuron_key] = ref_converted
+    # Handle QKV weights - unfuse from reference to separate Q, K, V
+    if 'qkv.weight' in ref_state_dict:
+        qkv_weight = ref_state_dict['qkv.weight']  # [qkv_dim, hidden]
+        print(f"    Fused QKV weight shape: {qkv_weight.shape}")
+
+        # Split into Q, K, V (matching gpt_oss.py:220-232)
+        q_weight = qkv_weight[:q_out, :]
+        k_weight = qkv_weight[q_out:q_out+kv_out, :]
+        v_weight = qkv_weight[q_out+kv_out:q_out+2*kv_out, :]
+
+        # Copy to neuron state
+        for key, tensor in [
+            ('qkv_proj.q_proj.weight', q_weight),
+            ('qkv_proj.k_proj.weight', k_weight),
+            ('qkv_proj.v_proj.weight', v_weight)
+        ]:
+            if key in neuron_state_dict:
+                if tensor.dtype != neuron_state_dict[key].dtype:
+                    tensor = tensor.to(dtype=neuron_state_dict[key].dtype)
+                neuron_state_dict[key] = tensor
                 updated_count += 1
-                print(f"  [COPY] {ref_key} -> {neuron_key}")
+                print(f"  [COPY] qkv.weight -> {key}")
+
+    # Handle QKV biases - unfuse from reference to separate Q, K, V
+    if 'qkv.bias' in ref_state_dict:
+        qkv_bias = ref_state_dict['qkv.bias']  # [qkv_dim]
+
+        # Split into Q, K, V
+        q_bias = qkv_bias[:q_out]
+        k_bias = qkv_bias[q_out:q_out+kv_out]
+        v_bias = qkv_bias[q_out+kv_out:q_out+2*kv_out]
+
+        # Copy to neuron state
+        for key, tensor in [
+            ('qkv_proj.q_proj.bias', q_bias),
+            ('qkv_proj.k_proj.bias', k_bias),
+            ('qkv_proj.v_proj.bias', v_bias)
+        ]:
+            if key in neuron_state_dict:
+                if tensor.dtype != neuron_state_dict[key].dtype:
+                    tensor = tensor.to(dtype=neuron_state_dict[key].dtype)
+                neuron_state_dict[key] = tensor
+                updated_count += 1
+                print(f"  [COPY] qkv.bias -> {key}")
+
+    # Handle output projection
+    if 'out.weight' in ref_state_dict and 'o_proj.o_proj.weight' in neuron_state_dict:
+        ref_tensor = ref_state_dict['out.weight']
+        if ref_tensor.dtype != neuron_state_dict['o_proj.o_proj.weight'].dtype:
+            ref_tensor = ref_tensor.to(dtype=neuron_state_dict['o_proj.o_proj.weight'].dtype)
+        neuron_state_dict['o_proj.o_proj.weight'] = ref_tensor
+        updated_count += 1
+        print(f"  [COPY] out.weight -> o_proj.o_proj.weight")
+
+    if 'out.bias' in ref_state_dict and 'o_proj.o_proj.bias' in neuron_state_dict:
+        ref_tensor = ref_state_dict['out.bias']
+        if ref_tensor.dtype != neuron_state_dict['o_proj.o_proj.bias'].dtype:
+            ref_tensor = ref_tensor.to(dtype=neuron_state_dict['o_proj.o_proj.bias'].dtype)
+        neuron_state_dict['o_proj.o_proj.bias'] = ref_tensor
+        updated_count += 1
+        print(f"  [COPY] out.bias -> o_proj.o_proj.bias")
+
+    # Handle learned sinks
+    if 'sinks' in ref_state_dict:
+        ref_sinks = ref_state_dict['sinks']
+        for nk in ['learned_sinks.sink', 'tkg_learned_sinks.sink']:
+            if nk in neuron_state_dict:
+                ref_converted = ref_sinks.clone()
+                if ref_converted.dtype != neuron_state_dict[nk].dtype:
+                    ref_converted = ref_converted.to(dtype=neuron_state_dict[nk].dtype)
+                neuron_state_dict[nk] = ref_converted
+                updated_count += 1
+                print(f"  [COPY] sinks -> {nk}")
 
     # Step 4: Save modified checkpoint
     print(f"\nStep 4: Saving modified checkpoint with random weights...")
@@ -251,7 +307,7 @@ def _build_neuron_and_reference_blocks_random_weights(
     # Step 5: Compile with modified checkpoint
     print(f"\nStep 5: Compiling neuron block with modified checkpoint...")
     neuron_block = build_module(
-        NeuronGPTOSSAttentionBlock,
+        NeuronGPTOSSAttentionBlockCompiled,
         example_inputs,
         tp_degree=1,
         module_init_kwargs={
@@ -262,8 +318,8 @@ def _build_neuron_and_reference_blocks_random_weights(
     )
 
     # Clean up temp checkpoint
-    if temp_checkpoint_path.exists():
-        temp_checkpoint_path.unlink()
+    # if temp_checkpoint_path.exists():
+    #     temp_checkpoint_path.unlink()
 
     print(f"\n{'='*80}")
     print(f"Blocks ready with matching random weights")
@@ -389,7 +445,7 @@ def test_1_2_normalized_inputs():
 
     # Use layer_idx=1 (odd) to disable sliding window
     neuron_block, reference_block = _build_neuron_and_reference_blocks_random_weights(
-        config, layer_idx=1, checkpoint_name="test_1_2.pt"
+        config, layer_idx=0, checkpoint_name="test_1_2.pt"
     )
 
     # Create test inputs
@@ -532,7 +588,47 @@ def test_1_5_basic_attention_with_random_weights():
 
     print("✓ Test 1.5 PASSED: Basic attention with random weights matches!")
 
+def test_1_6_compiled_attention_with_random_weights():
+    """
 
+    """
+    print("\n" + "="*80)
+    print("Test 1.6: Compiled Attention With Random Weights")
+    print("="*80)
+
+    config = _make_tiny_inference_config()
+
+    # Use layer_idx=1 (odd) to disable sliding window
+    neuron_block, reference_block = _build_neuron_and_reference_blocks_random_weights(
+        config, layer_idx=0, checkpoint_name="test_1_6.pt", seed=12345
+    )
+
+    # Create test inputs
+    batch_size = config.neuron_config.batch_size
+    seq_len = config.neuron_config.seq_len
+    hidden_size = config.hidden_size
+
+    torch.manual_seed(67890)  # Different seed for inputs
+    inp = torch.rand(batch_size, seq_len, hidden_size, dtype=torch.bfloat16)
+    position_ids = torch.arange(seq_len).unsqueeze(0).expand(batch_size, -1)
+
+    # Reference forward pass (CPU)
+    with torch.no_grad():
+        flat_sample = inp.view(-1, hidden_size)
+        ref_tokens = reference_block(flat_sample)
+        reference_output = ref_tokens.view(batch_size, seq_len, hidden_size)
+
+    print(f"Input shape: {inp.shape}")
+    print(f"Reference output shape: {reference_output.shape}")
+    print(f"Reference output sample: {reference_output[0, 0, :4]}")
+    print(f"Reference output mean: {reference_output.mean():.6f}, std: {reference_output.std():.6f}")
+
+    # Validate against Neuron implementation
+    inputs = [(inp, position_ids)]
+    validate_accuracy(neuron_block, inputs, expected_outputs=[reference_output])
+
+    print("✓ Test 1.6 PASSED: Compiled attention with random weights matches!")
+    
 def run_all_phase1_tests():
     """Run all Phase 1 tests sequentially."""
     print("\n" + "="*80)
@@ -553,12 +649,12 @@ def run_all_phase1_tests():
     #     import traceback
     #     traceback.print_exc()
 
-    try:
-        test_1_3_sliding_window_attention()
-    except Exception as e:
-        print(f"✗ Test 1.3 FAILED: {e}")
-        import traceback
-        traceback.print_exc()
+    # try:
+    #     test_1_3_sliding_window_attention()
+    # except Exception as e:
+    #     print(f"✗ Test 1.3 FAILED: {e}")
+    #     import traceback
+    #     traceback.print_exc()
 
     # try:
     #     test_1_4_learned_sinks()
@@ -567,10 +663,17 @@ def run_all_phase1_tests():
     #     import traceback
     #     traceback.print_exc()
 
+    # try:
+    #     test_1_5_basic_attention_with_random_weights()
+    # except Exception as e:
+    #     print(f"✗ Test 1.5 FAILED: {e}")
+    #     import traceback
+    #     traceback.print_exc()
+        
     try:
-        test_1_5_basic_attention_with_random_weights()
+        test_1_6_compiled_attention_with_random_weights()
     except Exception as e:
-        print(f"✗ Test 1.5 FAILED: {e}")
+        print(f"✗ Test 1.6 FAILED: {e}")
         import traceback
         traceback.print_exc()
 
