@@ -137,12 +137,12 @@ class NeuronGPTOSSExpertFusedColumnParallelLinear(layers.ColumnParallelLinear, E
             autograd_func_class=self.autograd_func_class,
             process_group=self.tensor_parallel_group,
         )
-        if self.bias is not None:
-            bias = self.bias[expert_indices, :] if expert_indices is not None else self.bias
-            # Reshape bias to broadcast across expert capacity dimensions
-            while bias.dim() < output.dim():
-                bias = bias.unsqueeze(1)
-            output = output + bias
+        bias = self.bias[expert_indices, :] if expert_indices is not None else self.bias
+        # Reshape bias to broadcast across expert capacity dimensions
+        while bias.dim() < output.dim():
+            bias = bias.unsqueeze(1)
+        output = output + bias
+        
         return output
 
 
@@ -224,11 +224,10 @@ class NeuronGPTOSSExpertFusedRowParallelLinear(layers.RowParallelLinear, ExpertF
 
         output = self._rpl_maybe_reduce_output(output_parallel)
 
-        if self.bias is not None:
-            bias = self.bias[expert_indices, :] if expert_indices is not None else self.bias
-            while bias.dim() < output.dim():
-                bias = bias.unsqueeze(1)
-            output = output + bias
+        bias = self.bias[expert_indices, :] if expert_indices is not None else self.bias
+        while bias.dim() < output.dim():
+            bias = bias.unsqueeze(1)
+        output = output + bias
 
         return output
 
@@ -416,86 +415,3 @@ class NeuronGPTOSSExpertMLPs(NeuronGPTOSSExpertMLPsV2):
              tensor_model_parallel_group=tensor_model_parallel_group,
              expert_model_parallel_group=expert_model_parallel_group,
         )
-
-
-# Working MoE Block
-class NeuronMLPBlock(torch.nn.Module):
-    def __init__(
-        self,
-        config,
-        device: torch.device | None = None,
-        weight_init_value: float | None = None,
-    ):
-        super().__init__()
-        self.num_experts = config.num_local_experts
-        self.experts_per_token = config.num_experts_per_tok
-        # self.swiglu_limit = config.swiglu_limit
-        self.world_size = 1
-        
-        # RMSNorm (kept as is)
-        self.norm = RMSNorm(config.hidden_size, device=device)
-        
-        # Create Router (replaces self.gate)
-        self.router = RouterTopK(
-            num_experts=config.num_local_experts,
-            top_k=config.num_experts_per_tok,
-            hidden_size=config.hidden_size,
-            act_fn="softmax",  # matches your softmax
-            dtype=torch.bfloat16,
-            device=device,
-            # bias=False, 
-            sequence_parallel_enabled=False,  # adjust based on your setup
-        )
-        
-        # Create ExpertMLPs (replaces manual mlp1/mlp2 weights)
-        self.expert_mlps = NeuronGPTOSSExpertMLPs(
-            num_experts=config.num_local_experts,
-            top_k=config.num_experts_per_tok,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            hidden_act="silu",  # SwiGLU uses SiLU internally
-            glu_mlp=True,  # SwiGLU is a GLU variant
-            # glu_type=GLUType.SWIGLU,  # specify SwiGLU
-            capacity_factor=None,  # full capacity (no dropping)
-            normalize_top_k_affinities=True,  # your softmax normalizes
-            # bias=False,  # as you mentioned
-            dtype=torch.bfloat16,
-            device=device,
-            tensor_model_parallel_group=None,  # set if using TP
-            # sequence_parallel_enabled=False,
-        )
-        
-        # Create complete MoE layer
-        # self.moe = MoE(
-        #     router=self.router,
-        #     expert_mlps=self.expert_mlps,
-        #     # rmsnorm=self.norm,  # can pass norm to MoE
-        #     sequence_parallel_enabled=False,
-        #     return_router_logits=False,  # set True if you need them
-        #     return_expert_index=False,   # set True if you need them
-        # )
-        if weight_init_value is not None:
-            _fill_module_parameters(self, weight_init_value)
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Original: x → norm → gate → topk → expert_mlps → weighted_sum → x + residual
-        # With MoE blocks: x → MoE (does all of the above) → x + residual
-        
-        # Option 1: Use MoE layer directly (it handles norm, routing, experts)
-        # moe_output = self.moe(x)
-        # return moe_output
-        
-        # Option 2: Manual control (closer to your original)
-        # If you want to separate norm from MoE:
-        t = self.norm(x)
-        router_logits, expert_affinities, expert_index = self.router(t)
-        t_flat = t.view(-1, t.shape[-1])  # (B*S, H)
-        seq_len = x.shape[1]
-        moe_output = self.expert_mlps(
-            hidden_states=t,
-            expert_affinities=expert_affinities,
-            expert_index=expert_index,
-            seq_len=seq_len
-        )
-        moe_output = moe_output.view_as(x)
-        return moe_output
