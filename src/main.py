@@ -6,6 +6,7 @@ from transformers import AutoTokenizer, GenerationConfig
 
 from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config, HuggingFaceGenerationAdapter
 from neuronx_distributed_inference.utils.accuracy import get_generate_outputs
+from neuronx_distributed_inference.modules.generation.sampling import prepare_sampling_params
 
 from model import NeuronGPTOSSForCausalLM
 
@@ -155,7 +156,11 @@ def prepare_inference(model_cls, args):
     generation_config_kwargs = {
         k: getattr(args, k) for k in generation_config_args if getattr(args, k) is not None
     }
-    generation_config.update(**generation_config_kwargs)
+    remaining_kwargs = generation_config.update(**generation_config_kwargs)
+
+    # add any remaining ones (this can happen when the model generation config is missing some entries)
+    for k, v in remaining_kwargs.items():
+        generation_config.__dict__[k] = v
 
     return model, tokenizer, generation_config
 
@@ -163,7 +168,7 @@ def run_generation(model, tokenizer, prompts, generation_config):
     print("\nGenerating outputs...")
     print(f"Prompts: {prompts}")
 
-    _, output_tokens = get_generate_outputs(
+    outputs, output_tokens = get_generate_outputs(
         model,
         prompts,
         tokenizer,
@@ -172,6 +177,7 @@ def run_generation(model, tokenizer, prompts, generation_config):
         max_length=model.neuron_config.max_length,
     )
 
+    print(outputs)
     print("Generated outputs:")
     for i, output_token in enumerate(output_tokens):
         print(f"Output {i}: {output_token}")
@@ -189,6 +195,24 @@ def main():
     model, tokenizer, generation_config = prepare_inference(NeuronGPTOSSForCausalLM, args)
     
     print("Compiled!")
+    
+    sampling_params = prepare_sampling_params(batch_size=model.neuron_config.batch_size, top_k=[10, 5], top_p=[0.5, 0.9],  temperature=[0.9, 0.5])
+    print(f"Prompts: {args.prompts}")
+    inputs = tokenizer(args.prompts, padding=True, return_tensors="pt")
+    print(f"Input ids: {inputs}")
+    
+    generation_model = HuggingFaceGenerationAdapter(model)
+    outputs = generation_model.generate(
+        inputs.input_ids,
+        generation_config=generation_config,
+        attention_mask=inputs.attention_mask,
+        max_length=model.config.neuron_config.max_length,
+        sampling_params=sampling_params,
+    )
+    output_tokens = tokenizer.batch_decode(outputs, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+    print("Generated outputs:")
+    for i, output_token in enumerate(output_tokens):
+        print(f"Output {i}: {output_token}")
     
     run_generation(
         model,

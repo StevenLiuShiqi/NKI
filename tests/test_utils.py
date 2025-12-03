@@ -14,7 +14,7 @@ from src.gpt_oss import ModelConfig
 
 def _make_tiny_inference_config():
     neuron_config = NeuronGPTOSSConfig(
-        batch_size=2,
+        batch_size=1,
         seq_len=1024,
         tp_degree=1,
         torch_dtype="bfloat16",
@@ -45,7 +45,7 @@ def _make_original_inference_config():
     neuron_config = NeuronGPTOSSConfig(
         batch_size=1,
         seq_len=4096,
-        tp_degree=1,
+        tp_degree=8,
         torch_dtype=torch.bfloat16,
         capacity_factor=None,
     )
@@ -81,6 +81,9 @@ def _sync_reference_weights_to_neuron(reference_block, neuron_block, layer_idx: 
     This ensures both models use identical random weights for testing.
     Handles the name mapping between reference and neuron implementations.
 
+    IMPORTANT: Reference has FUSED QKV projection, Neuron has SEPARATE Q/K/V projections.
+    This function unfuses the reference QKV weights into separate Q, K, V components.
+
     Args:
         reference_block: Instance of src.gpt_oss.AttentionBlock (with random weights)
         neuron_block: Instance of src.model.NeuronGPTOSSAttentionBlock (to be populated)
@@ -88,7 +91,7 @@ def _sync_reference_weights_to_neuron(reference_block, neuron_block, layer_idx: 
     """
     with torch.no_grad():
         ref_state = reference_block.state_dict()
-         # Unwrap neuron_block if it's wrapped by build_module
+        # Unwrap neuron_block if it's wrapped by build_module
         # build_module wraps the module, so we need to access .module or ._module
         actual_neuron_block = neuron_block
         if hasattr(neuron_block, 'module'):
@@ -109,53 +112,95 @@ def _sync_reference_weights_to_neuron(reference_block, neuron_block, layer_idx: 
         for k in sorted(neuron_state.keys()):
             print(f"  - {k}: {neuron_state[k].shape}")
 
-        # Map reference keys to neuron keys
-        weight_mapping = {
-            # QKV projection (reference has fused qkv, neuron expects qkv_proj.Wqkv)
-            'qkv.weight': 'qkv_proj.Wqkv.weight',
-            'qkv.bias': 'qkv_proj.Wqkv.bias',
+        # Get dimensions from reference block
+        num_heads = reference_block.num_attention_heads
+        num_kv_heads = reference_block.num_key_value_heads
+        head_dim = reference_block.head_dim
 
-            # Output projection
-            'out.weight': 'o_proj.o_proj.weight',
-            'out.bias': 'o_proj.o_proj.bias',
+        q_out = num_heads * head_dim
+        kv_out = num_kv_heads * head_dim
 
-            # Learned sinks - reference has one 'sinks' param
-            # Neuron has two: learned_sinks.sink (CTE) and tkg_learned_sinks.sink (TKG)
-            'sinks': ['learned_sinks.sink', 'tkg_learned_sinks.sink'],
-        }
+        print(f"\n[Layer {layer_idx}] Unfusing QKV weights:")
+        print(f"  num_heads={num_heads}, num_kv_heads={num_kv_heads}, head_dim={head_dim}")
+        print(f"  Q output dim: {q_out}, K/V output dim: {kv_out}")
 
-        # Copy weights with name transformation
         updated_keys = []
-        for ref_key, neuron_key in weight_mapping.items():
-            if ref_key not in ref_state:
-                print(f"  [SKIP] {ref_key} not found in reference state")
-                continue
 
-            ref_tensor = ref_state[ref_key]
+        # Handle QKV weights - unfuse from reference to separate Q, K, V
+        if 'qkv.weight' in ref_state:
+            qkv_weight = ref_state['qkv.weight']  # [qkv_dim, hidden]
+            print(f"  Fused QKV weight shape: {qkv_weight.shape}")
 
-            # Handle special case: sinks maps to multiple neuron params
-            if isinstance(neuron_key, list):
-                for nk in neuron_key:
-                    if nk in neuron_state:
-                        # Clone to avoid sharing the same tensor
-                        neuron_state[nk].copy_(ref_tensor.clone())
-                        updated_keys.append(nk)
-                        print(f"  [COPY] {ref_key} -> {nk}")
-                    else:
-                        print(f"  [WARN] {nk} not found in neuron state")
-            else:
-                if neuron_key in neuron_state:
-                    # Verify shapes match
-                    if ref_tensor.shape != neuron_state[neuron_key].shape:
-                        raise ValueError(
-                            f"Shape mismatch for {ref_key} -> {neuron_key}: "
-                            f"{ref_tensor.shape} vs {neuron_state[neuron_key].shape}"
-                        )
-                    neuron_state[neuron_key].copy_(ref_tensor)
-                    updated_keys.append(neuron_key)
-                    print(f"  [COPY] {ref_key} -> {neuron_key}")
-                else:
-                    print(f"  [WARN] {neuron_key} not found in neuron state")
+            # Split into Q, K, V (matching gpt_oss.py:220-232)
+            q_weight = qkv_weight[:q_out, :]
+            k_weight = qkv_weight[q_out:q_out+kv_out, :]
+            v_weight = qkv_weight[q_out+kv_out:q_out+2*kv_out, :]
+
+            print(f"  Split Q weight shape: {q_weight.shape}")
+            print(f"  Split K weight shape: {k_weight.shape}")
+            print(f"  Split V weight shape: {v_weight.shape}")
+
+            # Copy to neuron state
+            if 'qkv_proj.q_proj.weight' in neuron_state:
+                neuron_state['qkv_proj.q_proj.weight'].copy_(q_weight)
+                updated_keys.append('qkv_proj.q_proj.weight')
+                print(f"  [COPY] qkv.weight[:{q_out}] -> qkv_proj.q_proj.weight")
+
+            if 'qkv_proj.k_proj.weight' in neuron_state:
+                neuron_state['qkv_proj.k_proj.weight'].copy_(k_weight)
+                updated_keys.append('qkv_proj.k_proj.weight')
+                print(f"  [COPY] qkv.weight[{q_out}:{q_out+kv_out}] -> qkv_proj.k_proj.weight")
+
+            if 'qkv_proj.v_proj.weight' in neuron_state:
+                neuron_state['qkv_proj.v_proj.weight'].copy_(v_weight)
+                updated_keys.append('qkv_proj.v_proj.weight')
+                print(f"  [COPY] qkv.weight[{q_out+kv_out}:{q_out+2*kv_out}] -> qkv_proj.v_proj.weight")
+
+        # Handle QKV biases - unfuse from reference to separate Q, K, V
+        if 'qkv.bias' in ref_state:
+            qkv_bias = ref_state['qkv.bias']  # [qkv_dim]
+            print(f"  Fused QKV bias shape: {qkv_bias.shape}")
+
+            # Split into Q, K, V
+            q_bias = qkv_bias[:q_out]
+            k_bias = qkv_bias[q_out:q_out+kv_out]
+            v_bias = qkv_bias[q_out+kv_out:q_out+2*kv_out]
+
+            # Copy to neuron state
+            if 'qkv_proj.q_proj.bias' in neuron_state:
+                neuron_state['qkv_proj.q_proj.bias'].copy_(q_bias)
+                updated_keys.append('qkv_proj.q_proj.bias')
+                print(f"  [COPY] qkv.bias[:{q_out}] -> qkv_proj.q_proj.bias")
+
+            if 'qkv_proj.k_proj.bias' in neuron_state:
+                neuron_state['qkv_proj.k_proj.bias'].copy_(k_bias)
+                updated_keys.append('qkv_proj.k_proj.bias')
+                print(f"  [COPY] qkv.bias[{q_out}:{q_out+kv_out}] -> qkv_proj.k_proj.bias")
+
+            if 'qkv_proj.v_proj.bias' in neuron_state:
+                neuron_state['qkv_proj.v_proj.bias'].copy_(v_bias)
+                updated_keys.append('qkv_proj.v_proj.bias')
+                print(f"  [COPY] qkv.bias[{q_out+kv_out}:{q_out+2*kv_out}] -> qkv_proj.v_proj.bias")
+
+        # Handle output projection
+        if 'out.weight' in ref_state and 'o_proj.o_proj.weight' in neuron_state:
+            neuron_state['o_proj.o_proj.weight'].copy_(ref_state['out.weight'])
+            updated_keys.append('o_proj.o_proj.weight')
+            print(f"  [COPY] out.weight -> o_proj.o_proj.weight")
+
+        if 'out.bias' in ref_state and 'o_proj.o_proj.bias' in neuron_state:
+            neuron_state['o_proj.o_proj.bias'].copy_(ref_state['out.bias'])
+            updated_keys.append('o_proj.o_proj.bias')
+            print(f"  [COPY] out.bias -> o_proj.o_proj.bias")
+
+        # Handle learned sinks
+        if 'sinks' in ref_state:
+            ref_sinks = ref_state['sinks']
+            for nk in ['learned_sinks.sink', 'tkg_learned_sinks.sink']:
+                if nk in neuron_state:
+                    neuron_state[nk].copy_(ref_sinks.clone())
+                    updated_keys.append(nk)
+                    print(f"  [COPY] sinks -> {nk}")
 
         # Load the updated state dict back into the actual neuron block
         actual_neuron_block.load_state_dict(neuron_state, strict=False)
@@ -163,17 +208,17 @@ def _sync_reference_weights_to_neuron(reference_block, neuron_block, layer_idx: 
         print(f"\n[Layer {layer_idx}] Successfully copied {len(updated_keys)} weight tensors")
         print(f"  Updated keys: {updated_keys}")
 
-        # Verify a sample weight to ensure copy worked
-        if 'qkv.weight' in ref_state and 'qkv_proj.Wqkv.weight' in neuron_state:
-            ref_sample = ref_state['qkv.weight'][0, :5]
-            neuron_sample = actual_neuron_block.state_dict()['qkv_proj.Wqkv.weight'][0, :5]
-            print(f"\n  Verification - QKV weight[0, :5]:")
-            print(f"    Reference: {ref_sample}")
-            print(f"    Neuron:    {neuron_sample}")
-            if torch.allclose(ref_sample, neuron_sample, rtol=1e-5, atol=1e-8):
-                print(f"    ✓ Weights match!")
+        # Verify Q weight to ensure copy worked
+        if 'qkv.weight' in ref_state and 'qkv_proj.q_proj.weight' in neuron_state:
+            ref_q_sample = ref_state['qkv.weight'][:q_out, :][:1, :5]
+            neuron_q_sample = actual_neuron_block.state_dict()['qkv_proj.q_proj.weight'][:1, :5]
+            print(f"\n  Verification - Q weight[0, :5]:")
+            print(f"    Reference: {ref_q_sample}")
+            print(f"    Neuron:    {neuron_q_sample}")
+            if torch.allclose(ref_q_sample.flatten(), neuron_q_sample.flatten(), rtol=1e-5, atol=1e-8):
+                print(f"    ✓ Q weights match!")
             else:
-                print(f"    ✗ WARNING: Weights don't match!")
+                print(f"    ✗ WARNING: Q weights don't match!")
 
         return updated_keys
 

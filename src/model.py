@@ -25,7 +25,7 @@ from neuronx_distributed.modules.moe.routing import RouterTopK
 from neuronx_distributed.modules.rms_norm import RMSNorm
 
 from neuronx_distributed_inference.models.config import InferenceConfig, MoENeuronConfig
-from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase
+from neuronx_distributed_inference.modules.attention.attention_base import NeuronAttentionBase, NeuronAttentionBaseOutput
 from neuronx_distributed_inference.modules.attention.utils import RotaryEmbedding
 from neuronx_distributed.parallel_layers.layers import ColumnParallelLinear, ParallelEmbedding
 from neuronx_distributed_inference.models.model_base import (
@@ -104,6 +104,10 @@ def convert_gptoss_to_neuron_state_dict(
 
         # ---- Infer dims from config / tensors ----
         H = int(getattr(config, "hidden_size", nsd["embed_tokens.weight"].shape[1]))
+        num_heads = int(getattr(config, "num_attention_heads", 64))
+        num_kv_heads = int(getattr(config, "num_key_value_heads", 8))
+        head_dim = int(getattr(config, "head_dim", 64))
+
         # Find one gate_up to infer (E, H, 2I)
         gate_key = None
         for k in list(gptoss_sd.keys()):
@@ -123,96 +127,74 @@ def convert_gptoss_to_neuron_state_dict(
         })
 
         for idx, L in enumerate(layer_ids):
-            # ===== Attention: q/k/v -> fused Wqkv.{weight,bias}
+            # ===== Attention: q/k/v projections - NO TRANSPOSE NEEDED
+            # Both GPT-OSS and Neuron use standard PyTorch Linear format: (out_features, in_features)
+            q_out = num_heads * head_dim
+            kv_out = num_kv_heads * head_dim
+
+            # Q projection 
             q_w = take(f"model.layers.{L}.self_attn.q_proj.weight", None)
-            k_w = take(f"model.layers.{L}.self_attn.k_proj.weight", None)
-            v_w = take(f"model.layers.{L}.self_attn.v_proj.weight", None)
+            nsd[f"layers.{L}.self_attn.qkv_proj.q_proj.weight"] = to_target(q_w)
 
-            # Fuse QKV weights by concatenating along dim 0
-            if q_w is not None and k_w is not None and v_w is not None:
-                # Shapes: (q_out, H), (k_out, H), (v_out, H) -> (q_out+k_out+v_out, H)
-                fused_qkv_weight = torch.cat([q_w, k_w, v_w], dim=0)
-                nsd[f"layers.{L}.self_attn.qkv_proj.Wqkv.weight"] = to_target(fused_qkv_weight)
-
-            # Fuse QKV biases by concatenating
             q_b = take(f"model.layers.{L}.self_attn.q_proj.bias", None)
+            nsd[f"layers.{L}.self_attn.qkv_proj.q_proj.bias"] = to_target(q_b)
+
+            # K projection
+            k_w = take(f"model.layers.{L}.self_attn.k_proj.weight", None)
+            nsd[f"layers.{L}.self_attn.qkv_proj.k_proj.weight"] = to_target(k_w)
+
             k_b = take(f"model.layers.{L}.self_attn.k_proj.bias", None)
+            nsd[f"layers.{L}.self_attn.qkv_proj.k_proj.bias"] = to_target(k_b)
+
+            # V projection
+            v_w = take(f"model.layers.{L}.self_attn.v_proj.weight", None)
+            nsd[f"layers.{L}.self_attn.qkv_proj.v_proj.weight"] = to_target(v_w)
+
             v_b = take(f"model.layers.{L}.self_attn.v_proj.bias", None)
+            nsd[f"layers.{L}.self_attn.qkv_proj.v_proj.bias"] = to_target(v_b)
 
-            if q_b is not None and k_b is not None and v_b is not None:
-                # Shapes: (q_out,), (k_out,), (v_out,) -> (q_out+k_out+v_out,)
-                fused_qkv_bias = torch.cat([q_b, k_b, v_b], dim=0)
-                nsd[f"layers.{L}.self_attn.qkv_proj.Wqkv.bias"] = to_target(fused_qkv_bias)
-
-            # ===== Attention: out-proj -> o_proj.o_proj.{weight,bias}
+            # ===== Attention: out-proj
+            # Keeps PyTorch Linear format: (out, in) = (H, q_out)
             ow = take(f"model.layers.{L}.self_attn.o_proj.weight", None)
-            if ow is not None:
-                nsd[f"layers.{L}.self_attn.o_proj.o_proj.weight"] = to_target(ow)
+            nsd[f"layers.{L}.self_attn.o_proj.o_proj.weight"] = to_target(ow)
+
             ob = take(f"model.layers.{L}.self_attn.o_proj.bias", None)
-            if ob is not None:
-                nsd[f"layers.{L}.self_attn.o_proj.o_proj.bias"] = to_target(ob)
+            nsd[f"layers.{L}.self_attn.o_proj.o_proj.bias"] = to_target(ob)
 
             # ===== Attention sinks (learned sink tokens for sliding window attention)
-            # NeuronAttentionBase has two sink modules: learned_sinks (CTE) and tkg_learned_sinks (TKG)
-            # Both use the same source tensor from GPT-OSS model.layers.{L}.self_attn.sinks
+            # Only add learned_sinks (not tkg_learned_sinks unless hybrid parallelism is used)
             sinks = take(f"model.layers.{L}.self_attn.sinks", None)
-            if sinks is not None:
-                # Map to both CTE and TKG sink parameters (shape: [num_attention_heads])
-                nsd[f"layers.{L}.self_attn.learned_sinks.sink"] = to_target(sinks)
-                nsd[f"layers.{L}.self_attn.tkg_learned_sinks.sink"] = to_target(sinks.clone())
+            nsd[f"layers.{L}.self_attn.learned_sinks.sink"] = to_target(sinks)
 
             # ===== Router -> ffn.router.linear_router.{weight,bias}
             rw = take(f"model.layers.{L}.mlp.router.weight", None)
-            if rw is not None:
-                # Some GPT-OSS exports as [H,E]; NXD expects [E,H]
-                if rw.shape == (H, E):
-                    rw = rw.t().contiguous()
-                elif rw.shape != (E, H):
-                    raise ValueError(f"router.weight[{L}] has shape {rw.shape}, expected (E,H) or (H,E)")
-                nsd[f"layers.{L}.ffn.router.linear_router.weight"] = to_target(rw)
+            nsd[f"layers.{L}.ffn.router.linear_router.weight"] = to_target(rw)
 
             rb = take(f"model.layers.{L}.mlp.router.bias", None)
-            if rb is not None:
-                # Expect [E]
-                if rb.dim() != 1 or rb.numel() != E:
-                    raise ValueError(f"router.bias[{L}] has shape {tuple(rb.shape)}, expected ({E},)")
-                nsd[f"layers.{L}.ffn.router.linear_router.bias"] = to_target(rb)
+            nsd[f"layers.{L}.ffn.router.linear_router.bias"] = to_target(rb)
 
             # ===== Experts -> ffn.expert_mlps.mlp_op.{gate_up_proj,down_proj}.{weight,bias}
             gu = take(f"model.layers.{L}.mlp.experts.gate_up_proj", None)
-            if gu is not None:
-                if gu.shape != (E, H, 2*I):
-                    raise ValueError(f"gate_up_proj[{L}] {gu.shape} != (E,H,2I)=({E},{H},{2*I})")
-                nsd[f"layers.{L}.ffn.expert_mlps.mlp_op.gate_up_proj.weight"] = to_target(gu)
+            nsd[f"layers.{L}.ffn.expert_mlps.mlp_op.gate_up_proj.weight"] = to_target(gu)
 
             gub = take(f"model.layers.{L}.mlp.experts.gate_up_proj_bias", None)
-            if gub is not None:
-                if gub.shape != (E, 2*I):
-                    raise ValueError(f"gate_up_proj_bias[{L}] {gub.shape} != (E,2I)=({E},{2*I})")
-                nsd[f"layers.{L}.ffn.expert_mlps.mlp_op.gate_up_proj.bias"] = to_target(gub)
+            nsd[f"layers.{L}.ffn.expert_mlps.mlp_op.gate_up_proj.bias"] = to_target(gub)
 
             dp = take(f"model.layers.{L}.mlp.experts.down_proj", None)
-            if dp is not None:
-                if dp.shape == (E, H, I):
-                    dp = dp.transpose(1, 2).contiguous()  # -> [E, I, H]
-                if dp.shape != (E, I, H):
-                    raise ValueError(f"down_proj[{L}] {dp.shape} != (E,I,H)=({E},{I},{H})")
-                nsd[f"layers.{L}.ffn.expert_mlps.mlp_op.down_proj.weight"] = to_target(dp)
+            # Neuron expects: (E, I, H) for einsum("e...i,eih->e...h")
+            # Your model may have: (E, I, H) or (E, H, I)
+            dp = dp.transpose(1, 2).contiguous()  # -> (E, I, H)
+            nsd[f"layers.{L}.ffn.expert_mlps.mlp_op.down_proj.weight"] = to_target(dp)
 
             dpb = take(f"model.layers.{L}.mlp.experts.down_proj_bias", None)
-            if dpb is not None:
-                if dpb.shape != (E, H):
-                    raise ValueError(f"down_proj_bias[{L}] {dpb.shape} != (E,H)=({E},{H})")
-                nsd[f"layers.{L}.ffn.expert_mlps.mlp_op.down_proj.bias"] = to_target(dpb)
+            nsd[f"layers.{L}.ffn.expert_mlps.mlp_op.down_proj.bias"] = to_target(dpb)
 
-            # ===== Norms 
+            # ===== Norms
             iln = take(f"model.layers.{L}.input_layernorm.weight", None)
-            if iln is not None:
-                nsd[f"layers.{L}.input_layernorm.weight"] = to_target(iln)
+            nsd[f"layers.{L}.input_layernorm.weight"] = to_target(iln)
 
             paln = take(f"model.layers.{L}.post_attention_layernorm.weight", None)
-            if paln is not None:
-                nsd[f"layers.{L}.post_attention_layernorm.weight"] = to_target(paln)
+            nsd[f"layers.{L}.post_attention_layernorm.weight"] = to_target(paln)
 
             if gc_every and (idx % gc_every == 0):
                 gc.collect()
@@ -225,7 +207,7 @@ def convert_gptoss_to_neuron_state_dict(
 class NeuronGPTOSSConfig(MoENeuronConfig):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.fused_qkv = True
+        self.fused_qkv = False
 
 class GPTOSSInferenceConfig(InferenceConfig):
     def get_required_attributes(self) -> List[str]:
@@ -240,7 +222,7 @@ class GPTOSSInferenceConfig(InferenceConfig):
     @classmethod
     def get_neuron_config_cls(cls):
         return NeuronGPTOSSConfig
-    
+
 class NeuronGPTOSSMLPBlock(torch.nn.Module):
     def __init__(
         self,
@@ -255,7 +237,7 @@ class NeuronGPTOSSMLPBlock(torch.nn.Module):
         self.world_size = 1
         
         # RMSNorm
-        self.norm = RMSNorm(config.hidden_size, device=device)
+        self.norm = RMSNorm(config.hidden_size)
         
         # Create Router (replaces self.gate)
         self.router = RouterTopK(
@@ -281,7 +263,6 @@ class NeuronGPTOSSMLPBlock(torch.nn.Module):
             # glu_type=GLUType.SWIGLU,  # specify SwiGLU
             capacity_factor=None,  # full capacity (no dropping)
             normalize_top_k_affinities=False, 
-            # bias=False,  # as you mentioned
             dtype=torch.bfloat16,
             device=device,
             tensor_model_parallel_group=None,  # set if using TP
@@ -312,7 +293,182 @@ class NeuronGPTOSSMLPBlock(torch.nn.Module):
         )
         moe_output = moe_output.view_as(x)
         return moe_output
+    
+    
+class NeuronGPTOSSAttentionBlockCompiled(NeuronAttentionBase):
+    """
+    Attention block using NeuronAttentionBase with native compiler path.
+    Implements the SDPA logic from gpt_oss.py using PyTorch operations.
+    """
+    def __init__(self, config: InferenceConfig, layer_idx: int = 0, weight_init_value: float = None):
+        rotary_emb = RotaryEmbedding(
+            dim=config.head_dim,
+            max_position_embeddings=config.max_position_embeddings,
+            base=config.rope_theta,
+        )
+        sliding_window = getattr(config, 'sliding_window', None) if layer_idx % 2 == 0 else None
 
+        super().__init__(
+            config=config,
+            hidden_size=config.hidden_size,
+            head_dim=config.head_dim,
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=config.num_key_value_heads,
+            rotary_emb=rotary_emb,
+            qkv_bias=True,
+            o_bias=True,
+            learned_sinks_size=1,
+            sliding_window=sliding_window,
+        )
+
+        self.layer_idx = layer_idx
+        self.sm_scale = 1.0 / math.sqrt(self.head_dim)
+
+        if weight_init_value is not None:
+            self._initialize_weights(weight_init_value)
+
+    def _initialize_weights(self, value: float) -> None:
+        """Initialize all parameters to a constant value for deterministic testing."""
+        with torch.no_grad():
+            for param in self.parameters():
+                param.fill_(value)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        active_mask: Optional[torch.LongTensor] = None,
+        adapter_ids=None,
+        cos_cache: Optional[torch.Tensor] = None,
+        sin_cache: Optional[torch.Tensor] = None,
+        rmsnorm=None,
+        rotary_position_ids: Optional[torch.LongTensor] = None,
+        # args for kv cache usage
+        kv_mgr: Optional[KVCacheManager] = None,
+        get_kv_per_layer: bool = False,
+        update_kv_per_layer: bool = False,
+        residual: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        """
+        Native compiler attention path matching gpt_oss.py sdpa().
+
+        Uses prep_qkv_tensors from NeuronAttentionBase to get Q, K, V with RoPE applied,
+        then implements the SDPA logic with:
+        - GQA key/value expansion
+        - Learned sinks (single value per head)
+        - Sliding window masking (on even layers)
+        - Causal masking
+        """
+        bsz, q_len, _ = hidden_states.shape
+
+        # Use rotary_position_ids if provided, otherwise use position_ids
+        rope_position_ids = rotary_position_ids if rotary_position_ids is not None else position_ids
+
+        # Use base class to prepare QKV tensors with RoPE applied
+        # This handles: QKV projection, reshaping, and RoPE application
+        Q, K, V, cos_cache, sin_cache, residual = self.prep_qkv_tensors(
+            rope_position_ids,
+            hidden_states,
+            past_key_value,
+            adapter_ids=adapter_ids,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+            rmsnorm=rmsnorm,
+            skip_rope=False,  # Always apply RoPE
+            residual=residual,
+        )
+
+        # Q, K, V shapes from prep_qkv_tensors:
+        # Q: [B, num_heads, S, D]
+        # K: [B, num_kv_heads, S, D]
+        # V: [B, num_kv_heads, S, D]
+
+        # For gpt_oss.py compatibility, we need:
+        # Q: [S, num_kv_heads, q_mult, D]
+        # K: [S, num_kv_heads, D]
+        # V: [S, num_kv_heads, D]
+
+        # Reshape Q to separate GQA groups
+        Q = Q.view(bsz, self.num_key_value_heads, self.num_key_value_groups, q_len, self.head_dim)
+        Q = Q.permute(0, 3, 1, 2, 4).squeeze(0)  # [S, num_kv_heads, q_mult, D]
+
+        K = K.permute(0, 2, 1, 3).squeeze(0)  # [S, num_kv_heads, D]
+        V = V.permute(0, 2, 1, 3).squeeze(0)  # [S, num_kv_heads, D]
+
+        # Get learned sinks (single value per head)
+        learned_sinks = self.get_learned_sinks()
+        if learned_sinks is not None:
+            # sinks: [num_heads] -> reshape to [num_kv_heads, q_mult, 1, 1]
+            S = learned_sinks.view(self.num_key_value_heads, self.num_key_value_groups, 1, 1)
+            S = S.expand(-1, -1, q_len, -1)
+
+        # SDPA implementation from gpt_oss.py:152-172
+        n_tokens, n_heads, q_mult, d_head = Q.shape
+
+        # Expand K, V for GQA
+        K_expanded = K[:, :, None, :].expand(-1, -1, q_mult, -1)
+        V_expanded = V[:, :, None, :].expand(-1, -1, q_mult, -1)
+
+        # Build causal mask
+        mask = torch.triu(Q.new_full((n_tokens, n_tokens), -float("inf")), diagonal=1)
+
+        # Add sliding window mask if applicable
+        if self.sliding_window is not None and self.sliding_window > 0:
+            mask += torch.tril(
+                mask.new_full((n_tokens, n_tokens), -float("inf")),
+                diagonal=-self.sliding_window
+            )
+
+        # Compute attention scores: Q @ K^T
+        QK = torch.einsum("qhmd,khmd->hmqk", Q, K_expanded)
+        QK *= self.sm_scale
+        QK += mask[None, None, :, :]
+
+        # Concatenate learned sinks to scores
+        if learned_sinks is not None:
+            QK = torch.cat([QK, S], dim=-1)
+
+        # Softmax over keys (including sink)
+        W = torch.softmax(QK, dim=-1)
+
+        # Remove sink weights (we don't have sink values in V)
+        if learned_sinks is not None:
+            W = W[..., :-1]
+
+        # Compute attention output: W @ V
+        attn_output = torch.einsum("hmqk,khmd->qhmd", W, V_expanded)
+
+        # Reshape to [B, S, num_heads * D]
+        attn_output = attn_output.reshape(n_tokens, self.num_heads * self.head_dim)
+        attn_output = attn_output.unsqueeze(0)  # Add batch dimension
+
+        # Output projection using base class
+        attn_output = self.get_o_proj()(attn_output, adapter_ids=adapter_ids)
+
+        # Prepare KV cache (restore batch dimension)
+        K_cache = K.unsqueeze(0).permute(0, 2, 1, 3)  # [B, num_kv_heads, S, D]
+        V_cache = V.unsqueeze(0).permute(0, 2, 1, 3)  # [B, num_kv_heads, S, D]
+
+        if self.k_cache_transposed:
+            K_cache = K_cache.permute(0, 1, 3, 2)
+
+        kv = (K_cache, V_cache)
+
+        if update_kv_per_layer:
+            assert kv_mgr is not None
+            kv = kv_mgr.update_kv_by_layer_id(
+                kv_per_layer=kv,
+                position_ids=position_ids,
+                **kwargs,
+            )
+
+        # Return just the hidden states to match the test expectations
+        # The full output would be NeuronAttentionBaseOutput(attn_output, kv, cos_cache, sin_cache, residual)
+        return attn_output, kv, cos_cache, sin_cache, residual
+        
 class NeuronGPTOSSAttentionBlock(NeuronAttentionBase):
     def __init__(self, config: InferenceConfig, layer_idx: int = 0, weight_init_value: float = None):
         rotary_emb = RotaryEmbedding(
@@ -388,7 +544,7 @@ class NeuronGPTOSSAttentionBlock(NeuronAttentionBase):
         )
 
         # Return just the hidden states to match reference implementation
-        return output[0]
+        return output
 
 class NeuronGPTOSSBlock(nn.Module):
     def __init__(self, config: GPTOSSInferenceConfig, block_idx: int):
@@ -397,7 +553,7 @@ class NeuronGPTOSSBlock(nn.Module):
         self.hidden_size = config.hidden_size
         self.block_idx = block_idx
         
-        self.self_attn = NeuronGPTOSSAttentionBlock(config=config, layer_idx=self.block_idx)
+        self.self_attn = NeuronGPTOSSAttentionBlockCompiled(config=config, layer_idx=self.block_idx)
         self.ffn = NeuronGPTOSSMLPBlock(config=config)
         
         # RMS Norm
@@ -454,13 +610,7 @@ class NeuronGPTOSSModel(NeuronBaseModel):
         self.max_batch_size = config.neuron_config.max_batch_size
         self.buckets = config.neuron_config.buckets
 
-    # TODO
     def init_model(self, config: InferenceConfig):
-        self.embed_tokens = nn.Embedding(
-            num_embeddings=config.vocab_size,
-            embedding_dim=config.hidden_size,
-            padding_idx=getattr(config, "pad_token_id", None),
-        ) # FIX
         self.vocab_size = config.vocab_size
         
         self.embed_tokens = ParallelEmbedding(
