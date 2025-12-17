@@ -1,8 +1,11 @@
 import copy
+import logging
 import os
 from types import SimpleNamespace
 from typing import Any, Dict, Optional, Union
 import torch
+
+logger = logging.getLogger(__name__)
 from neuronx_distributed.utils.medusa_utils import (
     evaluate_posterior,
     generate_candidates,
@@ -119,8 +122,10 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
         self.prev_kv_cache_populated = False
         self.lora_checkpoint = LoraCheckpoint(self.neuron_config.lora_config)
         self.input_start_offsets = input_start_offsets
+        # Track the last absolute position for decode mode (when past_key_values is not accessible)
+        self.last_absolute_position = None
 
-    # IMPORTANT: don’t rebind self.forward; adapt outputs here
+    # IMPORTANT: don't rebind self.forward; adapt outputs here
     def forward(
         self,
         input_ids=None,
@@ -130,6 +135,12 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
         use_cache: bool = True,
         **kwargs,
     ) -> ModelOutput:
+        # STATELESS MODE: Force past_key_values=None and use_cache=False
+        # to decouple from KV cache mechanism. Every token is appended to 
+        # every preceding token and fed back into the model.
+        past_key_values = None
+        use_cache = False
+        
         out = self.neuron_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -213,9 +224,17 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
 
             if outputs.logits is not None:
                 next_token_logits = outputs.logits[:, -1, :].clone()
+                
+                # Log raw logits
+                top_k_logits, top_k_indices = torch.topk(next_token_logits[0], k=5)
+                logger.debug(f"GENERATION - Step {input_ids.shape[1]}, top 5 logits: {top_k_logits.tolist()}, tokens: {top_k_indices.tolist()}")
+                logger.debug(f"GENERATION - Logits stats: min={next_token_logits.min():.2f}, max={next_token_logits.max():.2f}, mean={next_token_logits.mean():.2f}")
 
                 # pre-process distribution
                 next_token_scores = logits_processor(input_ids, next_token_logits)
+                
+                top_k_scores, top_k_score_indices = torch.topk(next_token_scores[0], k=5)
+                logger.debug(f"GENERATION - After logits_processor, top 5 scores: {top_k_scores.tolist()}, tokens: {top_k_score_indices.tolist()}")
 
                 if return_dict_in_generate:
                     if output_scores:
@@ -240,6 +259,8 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
                 next_tokens = self.sampler(next_token_scores, sampling_params)
             else:
                 next_tokens = outputs.tokens
+            
+            logger.debug(f"GENERATION - Sampled token: {next_tokens[0].item()}, input_ids shape before cat: {input_ids.shape}")
 
             # finished sentences should have their next token be a padding token
             if has_eos_stopping_criteria:
@@ -249,6 +270,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
 
             # update generated ids, model inputs, and length for next step
             input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            logger.debug(f"GENERATION - input_ids after cat: {input_ids[0, -10:].tolist()}, shape: {input_ids.shape}")
 
             model_kwargs = self._update_model_kwargs_for_generation(
                 outputs,
@@ -280,8 +302,15 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
     ):
         # Store KV cache flag before forward pass.
         self.prev_kv_cache_populated = self.neuron_model.kv_cache_populated
-        if self.neuron_model.kv_cache_populated:
-            input_ids = input_ids[:, -1:]
+        
+        # Reset position tracking when starting a new prefill (cache was cleared)
+        if not self.neuron_model.kv_cache_populated and self.last_absolute_position is not None:
+            self.last_absolute_position = None
+            
+        # Truncate input_ids to last token during decode mode
+        # Check both kv_cache_populated and past_key_values since flag might not be set yet
+        # if self.neuron_model.kv_cache_populated or (past_key_values is not None and len(past_key_values) > 0):
+        #     input_ids = input_ids[:, -1:] KEVIN
 
         accepted_indices = kwargs.get("accepted_indices", None)
         current_length = kwargs.get("current_length", None)
@@ -290,23 +319,139 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
         position_ids = kwargs.get("position_ids", None)
         input_capture_hook = kwargs.get("input_capture_hook", None)
         tensor_capture_hook = kwargs.get("tensor_capture_hook", None)
+        
+        # past_key_values might be in kwargs instead of parameter
+        if past_key_values is None:
+            past_key_values = kwargs.get("past_key_values", None)
 
-        if attention_mask is not None and position_ids is None:
-            # create position_ids on the fly for batch generation
-            position_ids = attention_mask.long().cumsum(-1) - 1
+        # In stateless mode, always recompute position_ids from sequence length
+        # This is simpler and more direct than deriving from attention_mask
+        is_stateless_mode = not self.neuron_model.kv_cache_populated
+
+        if is_stateless_mode:
+            # In stateless mode, position_ids are simply [0, 1, 2, ..., seq_len-1]
+            # Compute directly from input_ids sequence length
+            batch_size, seq_len = input_ids.shape
+            position_ids = torch.arange(seq_len, dtype=torch.long, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
+            
             if self.input_start_offsets:
+                # Handle input_start_offsets if present
                 if len(self.input_start_offsets) > 1:
                     position_ids += torch.tensor(self.input_start_offsets, dtype=position_ids.dtype, device=position_ids.device)[:, None]
                 else:
                     position_ids += self.input_start_offsets[0]
                 for i, offset in enumerate(self.input_start_offsets):
-                    position_ids[i, 0:offset] = torch.arange(offset)
-            else:
-                position_ids.masked_fill_(attention_mask == 0, 1)
+                    position_ids[i, 0:offset] = torch.arange(offset, dtype=torch.long, device=position_ids.device)
+        elif attention_mask is not None and position_ids is None:
+            # Decode mode with KV cache: derive per-token positions from attention_mask.
+            #
+            # We deliberately ensure that padding tokens never share a valid position id
+            # with real tokens; otherwise RoPE would treat padding as a real position
+            # (e.g., position 1), which corrupts positional information and can lead
+            # to pathological repetition.
+            #
+            # Base positions from non‑padded tokens.
+            position_ids = attention_mask.long().cumsum(-1) - 1  # [0, 1, 2, ...] on tokens
 
-            if self.neuron_model.kv_cache_populated:
-                position_ids = torch.amax(position_ids, 1, keepdim=True)
-                position_ids = position_ids + 1
+            if self.input_start_offsets:
+                # Shift positions by per‑sequence offsets when present.
+                if len(self.input_start_offsets) > 1:
+                    position_ids += torch.tensor(
+                        self.input_start_offsets,
+                        dtype=position_ids.dtype,
+                        device=position_ids.device,
+                    )[:, None]
+                else:
+                    position_ids += self.input_start_offsets[0]
+                for i, offset in enumerate(self.input_start_offsets):
+                    # For any explicit prefix region, assign consecutive absolute positions.
+                    position_ids[i, 0:offset] = torch.arange(
+                        offset, dtype=position_ids.dtype, device=position_ids.device
+                    )
+            else:
+                # For padding, use a sentinel that does not collide with any real token position.
+                # We pick -1 here and rely on attention_mask to prevent pads from participating
+                # in attention; RoPE will see a distinct position for pads.
+                position_ids = position_ids.masked_fill(attention_mask == 0, -1)
+
+            # Track the max (non‑padding) position during prefill for use in decode
+            if not self.neuron_model.kv_cache_populated:
+                # During prefill, update last_absolute_position to the max position
+                max_pos = torch.amax(position_ids).item()
+                self.last_absolute_position = max_pos
+
+        # CRITICAL FIX: During decode, ALWAYS recompute position_ids to absolute position
+        # This must run even if position_ids was provided, to ensure correct absolute positions
+        # Problem: After a 128-token prefill (positions 0-127), the first decode should be at position 128,
+        # but the old code gave position 1. This caused RoPE misalignment and repeated tokens.
+        #
+        # Solution: Compute absolute position by:
+        # 1. If past_key_values is provided, extract cached sequence length from it
+        # 2. Otherwise, track position incrementally using self.last_absolute_position
+        # 3. Set position_ids to the absolute position of the new token
+        #
+        # Check for decode mode: either kv_cache_populated is True OR past_key_values exists
+        # (kv_cache_populated might not be set yet on first decode step, but past_key_values indicates decode)
+        # is_decode_mode = self.neuron_model.kv_cache_populated or (past_key_values is not None and len(past_key_values) > 0)
+        
+        # KEVIN: Only use decode-mode position_ids when KV cache is actually populated
+        # When KV cache is disabled, position_ids should always be computed from full attention_mask
+        is_decode_mode = self.neuron_model.kv_cache_populated
+        if is_decode_mode:
+            cached_seq_len = 0
+            
+            # Try to get cached sequence length from past_key_values if available
+            if past_key_values is not None and len(past_key_values) > 0:
+                try:
+                    # past_key_values is a tuple of (K, V) for each layer
+                    # K shape: [B, num_kv_heads, S_prior, D] or [B, num_kv_heads, D, S_prior]
+                    # V shape: [B, num_kv_heads, S_prior, D]
+                    # Use V to get sequence length (more reliable than K which might be transposed)
+                    first_layer_kv = past_key_values[0]
+                    if isinstance(first_layer_kv, (tuple, list)) and len(first_layer_kv) >= 2:
+                        V_cache = first_layer_kv[1]  # First layer's V cache
+                        if len(V_cache.shape) >= 3:
+                            # V shape is [B, num_kv_heads, S_prior, D] - sequence dim is at index 2
+                            cached_seq_len = V_cache.shape[2]
+                except (IndexError, AttributeError, TypeError) as e:
+                    # If we can't extract from past_key_values, fall through to other methods
+                    pass
+            
+            # If we couldn't get it from past_key_values (common with kv_mgr), 
+            # try to compute from attention_mask or use incremental tracking
+            if cached_seq_len == 0 and attention_mask is not None:
+                # attention_mask during decode might be just [1] for the new token
+                # or it might be the full sequence [1, 1, 1, ..., 1] including cached tokens
+                # If it's the full sequence, the cached length is attention_mask.sum() - 1
+                total_seq_len = attention_mask.sum(dim=1, keepdim=True).long()
+                # During decode, we're adding one new token, so cached length is total - 1
+                if total_seq_len.item() > 1:
+                    cached_seq_len = (total_seq_len - 1).item()
+            
+            # If we still don't have cached_seq_len, use incremental tracking
+            if cached_seq_len == 0:
+                if self.last_absolute_position is not None:
+                    # Increment from last known absolute position
+                    cached_seq_len = self.last_absolute_position + 1
+                else:
+                    # Fallback: this shouldn't happen if tracking works correctly
+                    # Use the old logic as last resort (may cause issues)
+                    if position_ids is not None:
+                        max_pos = torch.amax(position_ids, 1, keepdim=True)
+                        cached_seq_len = max_pos.item() + 1
+                    else:
+                        # Last resort: assume we're at position 1 (shouldn't happen)
+                        cached_seq_len = 1
+            
+            # Set position_ids to absolute position: cached_seq_len (0-indexed)
+            # The new token is at position cached_seq_len (after tokens at 0, 1, ..., cached_seq_len-1)
+            # Use input_ids.shape[0] to get batch size in case position_ids wasn't set yet
+            batch_size = input_ids.shape[0] if position_ids is None else position_ids.shape[0]
+            position_ids = torch.full((batch_size, 1), cached_seq_len, 
+                                     dtype=torch.long, device=input_ids.device)
+            
+            # Update tracking for next decode step
+            self.last_absolute_position = cached_seq_len
 
         # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
         if inputs_embeds is not None and past_key_values is None:
@@ -317,8 +462,11 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
         model_inputs.update(
             {
                 "position_ids": position_ids,
-                "past_key_values": past_key_values,
-                "use_cache": kwargs.get("use_cache", False),
+                # STATELESS MODE: Always force past_key_values=None and use_cache=False
+                # to decouple from KV cache mechanism. Every token is appended to every
+                # preceding token and fed back into the model.
+                "past_key_values": None,
+                "use_cache": False,
                 "attention_mask": attention_mask,
                 "medusa_args": (accepted_indices, current_length, medusa_mask, scatter_index),
                 "sampling_params": sampling_params,
@@ -391,7 +539,18 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
         # update attention mask
         if "attention_mask" in model_kwargs:
             attention_mask = model_kwargs["attention_mask"]
-            if is_for_token_generation:
+            # In stateless mode (KV cache disabled), always update attention_mask
+            # In decode mode (KV cache enabled), use token generation logic
+            is_stateless_mode = not self.neuron_model.kv_cache_populated
+            
+            if is_stateless_mode:
+                # Stateless mode: simply append a new 1 to attention_mask
+                attention_mask = torch.cat(
+                    [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))],
+                    dim=-1,
+                )
+            elif is_for_token_generation:
+                # Decode mode with KV cache: use existing logic
                 if self.padding_side == "left":
                     attention_mask = torch.cat(
                         [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))],

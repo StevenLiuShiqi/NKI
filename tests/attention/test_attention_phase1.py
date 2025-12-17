@@ -116,7 +116,7 @@ def _build_neuron_and_reference_blocks(
 
     # Build Neuron attention block
     neuron_block = build_module(
-        NeuronGPTOSSAttentionBlockCompiled,
+        NeuronGPTOSSAttentionBlock,
         example_inputs,
         tp_degree=1,
         module_init_kwargs={

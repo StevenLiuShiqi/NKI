@@ -49,10 +49,10 @@ def parse_args():
     # # On device sampling
     # parser.add_argument("--on-device-sampling", action="store_true")
 
-    # # Bucketing
-    # parser.add_argument("--enable-bucketing", type=bool, default=True)
+    # Bucketing
+    parser.add_argument("--enable-bucketing", type=bool, default=True)
     # parser.add_argument("--bucket-n-active-tokens", action="store_true")
-    # parser.add_argument("--context-encoding-buckets", nargs="+", type=int)
+    parser.add_argument("--context-encoding-buckets", nargs="+", type=int, default=[128])
     # parser.add_argument("--token-generation-buckets", nargs="+", type=int)
 
     # # Parallelism
@@ -143,6 +143,9 @@ def prepare_inference(model_cls, args):
     tokenizer = load_tokenizer(args.model_path, args.compiled_model_path, neuron_config)
     neuron_config.pad_token_id = tokenizer.pad_token_id
 
+    neuron_config.attn_block_tkg_nki_kernel_enabled = False
+    neuron_config.attn_block_cte_nki_kernel_enabled = False
+    
     # Configure generation config.
     generation_config = GenerationConfig.from_pretrained(args.model_path)
     generation_config_args = [
@@ -191,6 +194,14 @@ def main():
     args.batch_size = len(args.prompts)
     args.max_length = args.seq_len
     args.tol_map = "{None: (1e-5, 0.05), 1000: (1e-5, 0.03), 50: (1e-5, 0.03), 5: (1e-5, 0.03)}"
+    
+    # Set context_encoding_buckets to match stateless generation requirements
+    # For stateless generation, we pad to a fixed bucket size (128 based on error)
+    if not args.context_encoding_buckets:
+        args.context_encoding_buckets = [128]
+    
+    # Enable bucketing explicitly
+    args.enable_bucketing = True
 
     model, tokenizer, generation_config = prepare_inference(NeuronGPTOSSForCausalLM, args)
     

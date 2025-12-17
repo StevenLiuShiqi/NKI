@@ -8,6 +8,7 @@ import copy
 import gc
 import logging
 import math
+from statistics import linear_regression
 from typing import List, Optional, Tuple, Type
 
 import torch
@@ -183,7 +184,7 @@ def convert_gptoss_to_neuron_state_dict(
             dp = take(f"model.layers.{L}.mlp.experts.down_proj", None)
             # Neuron expects: (E, I, H) for einsum("e...i,eih->e...h")
             # Your model may have: (E, I, H) or (E, H, I)
-            dp = dp.transpose(1, 2).contiguous()  # -> (E, I, H)
+            # dp = dp.transpose(1, 2).contiguous()  # -> (E, I, H)
             nsd[f"layers.{L}.ffn.expert_mlps.mlp_op.down_proj.weight"] = to_target(dp)
 
             dpb = take(f"model.layers.{L}.mlp.experts.down_proj_bias", None)
@@ -293,19 +294,105 @@ class NeuronGPTOSSMLPBlock(torch.nn.Module):
         )
         moe_output = moe_output.view_as(x)
         return moe_output
+   
+def _compute_yarn_parameters():
+    base = 150000
+    partial_rotary_factor = 1.0
+    head_dim = 64
+    dim = int(head_dim * partial_rotary_factor)
+    factor = 32.0
+    attention_factor = None
+    mscale = None
+    mscale_all_dim = None
+    original_max_position_embeddings = 4096
+
+    def get_mscale(scale, mscale=1):
+        return 0.1 * mscale * math.log(scale) + 1.0
+
+    if attention_factor is None:
+        attention_factor = get_mscale(factor)
+            
+    beta_fast = 32.0
+    beta_slow = 1.0
+
+    def find_correction_dim(num_rotations, dim, base, max_position_embeddings):
+        return dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi)) / (2 * math.log(base))
+
+    def find_correction_range(low_rot, high_rot, dim, base, max_position_embeddings, truncate):
+        low = find_correction_dim(low_rot, dim, base, max_position_embeddings)
+        high = find_correction_dim(high_rot, dim, base, max_position_embeddings)
+        return (max(low, 0), min(high, dim - 1))
+
+    def linear_ramp_factor(min, max, dim):
+        linear_func = (torch.arange(dim, dtype=torch.float32) - min) / (max - min)
+        ramp_func = torch.clamp(linear_func, 0, 1)
+        return ramp_func
     
-    
+    pos_freqs = base ** (torch.arange(0, dim, 2).to(dtype=torch.float) / dim)
+    inv_freq_extrapolation = 1.0 / pos_freqs
+    inv_freq_interpolation = 1.0 / (factor * pos_freqs)
+    truncate = False
+    low, high = find_correction_range(beta_fast, beta_slow, dim, base, original_max_position_embeddings, truncate)
+    inv_freq_extrapolation_factor = 1 - linear_ramp_factor(low, high, dim // 2).to(dtype=torch.float)
+    inv_freq = inv_freq_interpolation * (1 - inv_freq_extrapolation_factor) + inv_freq_extrapolation * inv_freq_extrapolation_factor
+    return (inv_freq, attention_factor)
+
+
+def _apply_rotary_emb(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    first_half, second_half = torch.chunk(x, 2, dim=-1)
+    first_ = first_half * cos - second_half * sin
+    second_ = second_half * cos + first_half * sin
+    return torch.cat((first_, second_), dim=-1)
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = _apply_rotary_emb(q, cos, sin)
+    k_embed = _apply_rotary_emb(k, cos, sin)
+    return q_embed, k_embed
+
+class NeuronGPTOSSRotaryEmbedding(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        inv_freq, self.attention_scaling = _compute_yarn_parameters()
+        self.register_buffer('inv_freq', inv_freq, persistent=False)
+        self.original_inv_freq = self.inv_freq
+
+    @torch.no_grad()
+    def forward(self, x, position_ids):
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+        position_ids_expanded = position_ids[:, None, :].float()
+        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != 'mps' else 'cpu'
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = freqs
+            cos = emb.cos() * self.attention_scaling
+            sin = emb.sin() * self.attention_scaling
+        return (cos.to(x.dtype), sin.to(x.dtype))
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
+# Specifically enable debug logging for the "Neuron" logger used by attention_base
+logger = logging.getLogger("Neuron")
+logger.setLevel(logging.DEBUG)
+
 class NeuronGPTOSSAttentionBlockCompiled(NeuronAttentionBase):
     """
     Attention block using NeuronAttentionBase with native compiler path.
     Implements the SDPA logic from gpt_oss.py using PyTorch operations.
     """
     def __init__(self, config: InferenceConfig, layer_idx: int = 0, weight_init_value: float = None):
-        rotary_emb = RotaryEmbedding(
-            dim=config.head_dim,
-            max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
-        )
+        rotary_emb = NeuronGPTOSSRotaryEmbedding()
+        
         sliding_window = getattr(config, 'sliding_window', None) if layer_idx % 2 == 0 else None
 
         super().__init__(
@@ -320,7 +407,7 @@ class NeuronGPTOSSAttentionBlockCompiled(NeuronAttentionBase):
             learned_sinks_size=1,
             sliding_window=sliding_window,
         )
-
+        self.rotary_emb = rotary_emb
         self.layer_idx = layer_idx
         self.sm_scale = 1.0 / math.sqrt(self.head_dim)
 
@@ -362,11 +449,23 @@ class NeuronGPTOSSAttentionBlockCompiled(NeuronAttentionBase):
         - Sliding window masking (on even layers)
         - Causal masking
         """
+        
         bsz, q_len, _ = hidden_states.shape
+        logger.debug(f"Step info - q_len: {q_len}, position_ids: {position_ids}")
+        # if past_key_value is not None:
+        #     logger.debug(f"  Past cache shape: {past_key_value[0].shape}")
+        #     logger.debug(f"  Total seq len: {past_key_value[0].shape[2] + q_len}")
 
-        # Use rotary_position_ids if provided, otherwise use position_ids
+        # Extract cached sequence length if past_key_value is present
+        # This is needed to fix incorrect relative position_ids from the adapter
+        if get_kv_per_layer:
+            assert kv_mgr is not None
+            past_key_value = kv_mgr.get_kv_by_layer_id(**kwargs)
+        
+     
         rope_position_ids = rotary_position_ids if rotary_position_ids is not None else position_ids
-
+        
+   
         # Use base class to prepare QKV tensors with RoPE applied
         # This handles: QKV projection, reshaping, and RoPE application
         Q, K, V, cos_cache, sin_cache, residual = self.prep_qkv_tensors(
@@ -377,7 +476,7 @@ class NeuronGPTOSSAttentionBlockCompiled(NeuronAttentionBase):
             cos_cache=cos_cache,
             sin_cache=sin_cache,
             rmsnorm=rmsnorm,
-            skip_rope=False,  # Always apply RoPE
+            skip_rope=True,  # Bypass
             residual=residual,
         )
 
@@ -391,12 +490,29 @@ class NeuronGPTOSSAttentionBlockCompiled(NeuronAttentionBase):
         # K: [S, num_kv_heads, D]
         # V: [S, num_kv_heads, D]
 
+        # Apply RoPE: In stateless mode (past_key_value is None), always recompute cos/sin
+        # for the full sequence. In KV cache mode, reuse cache if available.
+        # STATELESS MODE: Always recompute RoPE for full sequence to ensure correct positions
+        if past_key_value is None:
+            # Stateless mode: always compute fresh cos/sin for the full sequence
+            cos_cache, sin_cache = self.rotary_emb(hidden_states, rope_position_ids)
+        elif cos_cache is None or sin_cache is None:
+            # KV cache mode: compute if cache is missing
+            cos_cache, sin_cache = self.rotary_emb(hidden_states, rope_position_ids)
+        Q, K = apply_rotary_pos_emb(Q, K, cos_cache, sin_cache)
+        
         # Reshape Q to separate GQA groups
         Q = Q.view(bsz, self.num_key_value_heads, self.num_key_value_groups, q_len, self.head_dim)
         Q = Q.permute(0, 3, 1, 2, 4).squeeze(0)  # [S, num_kv_heads, q_mult, D]
 
         K = K.permute(0, 2, 1, 3).squeeze(0)  # [S, num_kv_heads, D]
         V = V.permute(0, 2, 1, 3).squeeze(0)  # [S, num_kv_heads, D]
+
+        
+        # Prefill mode: use new K, V only
+        K_full = K
+        V_full = V
+        total_seq_len = q_len
 
         # Get learned sinks (single value per head)
         learned_sinks = self.get_learned_sinks()
@@ -408,24 +524,37 @@ class NeuronGPTOSSAttentionBlockCompiled(NeuronAttentionBase):
         # SDPA implementation from gpt_oss.py:152-172
         n_tokens, n_heads, q_mult, d_head = Q.shape
 
-        # Expand K, V for GQA
-        K_expanded = K[:, :, None, :].expand(-1, -1, q_mult, -1)
-        V_expanded = V[:, :, None, :].expand(-1, -1, q_mult, -1)
+        # Expand K, V for GQA (using K_full, V_full which includes prior cache if in decode mode)
+        K_expanded = K_full[:, :, None, :].expand(-1, -1, q_mult, -1)  # [total_seq_len, num_kv_heads, q_mult, D]
+        V_expanded = V_full[:, :, None, :].expand(-1, -1, q_mult, -1)  # [total_seq_len, num_kv_heads, q_mult, D]
 
-        # Build causal mask
+        # # Build causal mask - account for full sequence length
+        # if past_key_value is not None:
+        #     # Create mask for decode: [q_len, total_seq_len]
+        #     # Query has q_len tokens, keys have total_seq_len (prior + new)
+        #     # Decode mode: new token attends to all prior tokens (no causal mask needed)
+        #     mask = Q.new_zeros((n_tokens, total_seq_len))
+            
+        #     # Apply sliding window if configured
+        #     if self.sliding_window is not None and self.sliding_window > 0:
+        #         if total_seq_len > self.sliding_window: 
+        #             mask[:, :total_seq_len - self.sliding_window] = -float("inf")
+        # else:
+        # Original mask logic for prefill
         mask = torch.triu(Q.new_full((n_tokens, n_tokens), -float("inf")), diagonal=1)
-
-        # Add sliding window mask if applicable
         if self.sliding_window is not None and self.sliding_window > 0:
             mask += torch.tril(
                 mask.new_full((n_tokens, n_tokens), -float("inf")),
                 diagonal=-self.sliding_window
             )
+        
 
         # Compute attention scores: Q @ K^T
         QK = torch.einsum("qhmd,khmd->hmqk", Q, K_expanded)
         QK *= self.sm_scale
         QK += mask[None, None, :, :]
+        
+        logger.debug(f"DECODE Attention - QK shape: {QK.shape}")
 
         # Concatenate learned sinks to scores
         if learned_sinks is not None:
@@ -433,6 +562,9 @@ class NeuronGPTOSSAttentionBlockCompiled(NeuronAttentionBase):
 
         # Softmax over keys (including sink)
         W = torch.softmax(QK, dim=-1)
+        
+        if past_key_value is not None:
+            logger.debug(f"DECODE Attention - W shape: {W.shape}")
 
         # Remove sink weights (we don't have sink values in V)
         if learned_sinks is not None:
@@ -444,9 +576,15 @@ class NeuronGPTOSSAttentionBlockCompiled(NeuronAttentionBase):
         # Reshape to [B, S, num_heads * D]
         attn_output = attn_output.reshape(n_tokens, self.num_heads * self.head_dim)
         attn_output = attn_output.unsqueeze(0)  # Add batch dimension
+        
+        if past_key_value is not None:
+            logger.debug(f"DECODE Attention - attn_output shape: {attn_output.shape}")
 
         # Output projection using base class
         attn_output = self.get_o_proj()(attn_output, adapter_ids=adapter_ids)
+        
+        if past_key_value is not None:
+            logger.debug(f"DECODE Attention - after o_proj shape: {attn_output.shape}")
 
         # Prepare KV cache (restore batch dimension)
         K_cache = K.unsqueeze(0).permute(0, 2, 1, 3)  # [B, num_kv_heads, S, D]
@@ -467,14 +605,14 @@ class NeuronGPTOSSAttentionBlockCompiled(NeuronAttentionBase):
 
         # Return just the hidden states to match the test expectations
         # The full output would be NeuronAttentionBaseOutput(attn_output, kv, cos_cache, sin_cache, residual)
-        return attn_output, kv, cos_cache, sin_cache, residual
+        return attn_output, kv, cos_cache, sin_cache
         
 class NeuronGPTOSSAttentionBlock(NeuronAttentionBase):
     def __init__(self, config: InferenceConfig, layer_idx: int = 0, weight_init_value: float = None):
-        rotary_emb = RotaryEmbedding(
-            dim=config.head_dim,
-            max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
+        rotary_emb = NeuronGPTOSSRotaryEmbedding(
+            # dim=config.head_dim,
+            # max_position_embeddings=config.max_position_embeddings,
+            # base=config.rope_theta,
         )
 
         # Sliding window is applied to every other layer (even layer indices)
@@ -609,6 +747,7 @@ class NeuronGPTOSSModel(NeuronBaseModel):
         self.num_key_value_heads = config.num_key_value_heads
         self.max_batch_size = config.neuron_config.max_batch_size
         self.buckets = config.neuron_config.buckets
+        self.kv_cache_populated = False
 
     def init_model(self, config: InferenceConfig):
         self.vocab_size = config.vocab_size
@@ -636,6 +775,7 @@ class NeuronGPTOSSModel(NeuronBaseModel):
         )
 
 
+
 class NeuronGPTOSSForCausalLM(NeuronBaseForCausalLM):
     """
     This class can be used as GPTOSSForCausalLM
@@ -658,3 +798,19 @@ class NeuronGPTOSSForCausalLM(NeuronBaseForCausalLM):
     
     def get_compiler_args(self):
         return
+    
+    def _should_enable_tkg(self):
+        """
+        Override to disable token generation model for stateless generation.
+        In stateless mode, we always process the full sequence, so we can use
+        the context encoding model for all steps.
+        """
+        return False  # Don't compile token generation model
+    
+    def get_generation_model(self):
+        """
+        Override to always use context encoding model for stateless generation.
+        Since we're not using token generation model, always return context encoding model.
+        """
+        # Always return context encoding model since we're not using token generation model
+        return self.context_encoding_model
