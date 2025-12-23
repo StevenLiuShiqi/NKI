@@ -1,4 +1,7 @@
 hf_transfer
+networkx
+networkx-reverse-topological-sort
 safetensors
+safetensors-layer-grabber
 torch
 transformers

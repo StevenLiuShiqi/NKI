@@ -1,0 +1,366 @@
+[
+  {
+    "id": "rmsnorm_hidden",
+    "type": "RMSNorm",
+    "data_layout": null,
+    "dtype": "bfloat16",
+    "ops": [
+      {"op": "power", "exponent": 2},
+      {"op": "mean", "dim": -1, "keepdim": true},
+      {"op": "add", "scalar": 1e-05},
+      {"op": "rsqrt"},
+      {"op": "mul"},
+      {"op": "mul", "learnable": "scale"}
+    ],
+    "input_shape": ["num_tokens", 2880],
+    "output_shape": ["num_tokens", 2880],
+    "weights_fused": {
+      "scale": [2880]
+    },
+    "weights_original": {
+      "scale": [2880]
+    },
+    "count": 73,
+    "where": "AttentionBlock.norm, MLPBlock.norm, Transformer.norm (36 attn + 36 mlp + 1 final)",
+    "source": {
+      "module": "RMSNormFused",
+      "code": "def forward(self, x: torch.Tensor) -> torch.Tensor:\n    assert x.shape[-1] == self.num_features\n    t, dtype = x.float(), x.dtype\n    t = t * torch.rsqrt(torch.mean(t**2, dim=-1, keepdim=True) + self.eps)\n    return (t * self.scale).to(dtype)"
+    }
+  },
+  {
+    "id": "qkv_projection_gqa",
+    "type": "QKVProjection",
+    "data_layout": null,
+    "dtype": "bfloat16",
+    "ops": [
+      {"op": "linear", "in_features": 2880, "out_features": 5120, "bias": true},
+      {"op": "slice", "q_range": [0, 4096]},
+      {"op": "slice", "k_range": [4096, 4608]},
+      {"op": "slice", "v_range": [4608, 5120]},
+      {"op": "view", "q_reshape": [-1, 8, 8, 64]},
+      {"op": "view", "k_reshape": [-1, 8, 64]},
+      {"op": "view", "v_reshape": [-1, 8, 64]}
+    ],
+    "input_shape": ["num_tokens", 2880],
+    "output_shape": [["num_tokens", 8, 8, 64], ["num_tokens", 8, 64], ["num_tokens", 8, 64]],
+    "weights_fused": {
+      "qkv.weight": [5120, 2880],
+      "qkv.bias": [5120]
+    },
+    "weights_original": {
+      "qkv.weight": [5120, 2880],
+      "qkv.bias": [5120]
+    },
+    "count": 36,
+    "where": "AttentionBlockFused.qkv_proj (all 36 layers)",
+    "source": {
+      "module": "QKVProjection",
+      "code": "def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:\n    qkv = self.qkv(x)\n    q = qkv[:, : self.num_attention_heads * self.head_dim].contiguous()\n    k = qkv[:, self.num_attention_heads * self.head_dim : (self.num_attention_heads + self.num_key_value_heads) * self.head_dim].contiguous()\n    v = qkv[:, (self.num_attention_heads + self.num_key_value_heads) * self.head_dim : (self.num_attention_heads + 2 * self.num_key_value_heads) * self.head_dim].contiguous()\n    q = q.view(-1, self.num_key_value_heads, self.num_attention_heads // self.num_key_value_heads, self.head_dim)\n    k = k.view(-1, self.num_key_value_heads, self.head_dim)\n    v = v.view(-1, self.num_key_value_heads, self.head_dim)\n    return q, k, v"
+    }
+  },
+  {
+    "id": "rope_compute_yarn_ntk",
+    "type": "RotaryEmbeddingCompute",
+    "data_layout": null,
+    "dtype": "float32",
+    "ops": [
+      {"op": "arange", "start": 0, "end": 64, "step": 2},
+      {"op": "power", "base": 150000.0},
+      {"op": "yarn_ntk_interpolation", "scaling_factor": 32.0, "alpha": 1.0, "beta": 32.0},
+      {"op": "einsum", "pattern": "i,j->ij"},
+      {"op": "cos"},
+      {"op": "sin"},
+      {"op": "mul", "concentration": "computed"}
+    ],
+    "input_shape": ["num_tokens"],
+    "output_shape": [["num_tokens", 32], ["num_tokens", 32]],
+    "weights_fused": null,
+    "weights_original": null,
+    "count": 36,
+    "where": "AttentionBlockFused.rope_compute (all 36 layers)",
+    "source": {
+      "module": "RotaryEmbeddingCompute",
+      "code": "def forward(self, num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:\n    concentration, inv_freq = self._compute_concentration_and_inv_freq()\n    t = torch.arange(num_tokens, dtype=torch.float32, device=self.device)\n    freqs = torch.einsum(\"i,j->ij\", t, inv_freq)\n    cos = freqs.cos() * concentration\n    sin = freqs.sin() * concentration\n    return cos, sin"
+    }
+  },
+  {
+    "id": "apply_rope_qk",
+    "type": "ApplyRotaryEmbedding",
+    "data_layout": null,
+    "dtype": "bfloat16",
+    "ops": [
+      {"op": "unsqueeze", "dim": -2},
+      {"op": "chunk", "chunks": 2, "dim": -1},
+      {"op": "mul"},
+      {"op": "sub"},
+      {"op": "add"},
+      {"op": "cat", "dim": -1}
+    ],
+    "inputs": [["num_tokens", 8, 8, 64], ["num_tokens", 8, 64], ["num_tokens", 32], ["num_tokens", 32]],
+    "output_shape": [["num_tokens", 8, 8, 64], ["num_tokens", 8, 64]],
+    "weights_fused": null,
+    "weights_original": null,
+    "count": 36,
+    "where": "AttentionBlockFused.rope_apply (all 36 layers)",
+    "source": {
+      "module": "ApplyRotaryEmbedding",
+      "code": "def forward(self, query: torch.Tensor, key: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:\n    num_tokens = query.shape[0]\n    query_shape = query.shape\n    query = query.view(num_tokens, -1, self.head_dim)\n    query = self._apply_rotary_emb(query, cos, sin)\n    query = query.reshape(query_shape)\n    key_shape = key.shape\n    key = key.view(num_tokens, -1, self.head_dim)\n    key = self._apply_rotary_emb(key, cos, sin)\n    key = key.reshape(key_shape)\n    return query, key"
+    }
+  },
+  {
+    "id": "sdpa_sliding_window_sinks",
+    "type": "ScaledDotProductAttentionFused",
+    "data_layout": null,
+    "dtype": "bfloat16",
+    "ops": [
+      {"op": "expand", "k_expand": ["n_tokens", "n_heads", "q_mult", "d_head"]},
+      {"op": "expand", "v_expand": ["n_tokens", "n_heads", "q_mult", "d_head"]},
+      {"op": "triu", "diagonal": 1, "fill_value": "-inf"},
+      {"op": "tril", "diagonal": "neg_sliding_window", "fill_value": "-inf", "conditional": "sliding_window > 0"},
+      {"op": "einsum", "pattern": "qhmd,khmd->hmqk"},
+      {"op": "mul", "sm_scale": 0.125},
+      {"op": "add", "mask": true},
+      {"op": "cat", "sinks": true, "dim": -1},
+      {"op": "softmax", "dim": -1},
+      {"op": "slice", "drop_sink": true},
+      {"op": "einsum", "pattern": "hmqk,khmd->qhmd"}
+    ],
+    "inputs": [["n_tokens", 8, 8, 64], ["n_tokens", 8, 64], ["n_tokens", 8, 64], [64]],
+    "output_shape": ["n_tokens", 4096],
+    "weights_fused": null,
+    "weights_original": null,
+    "count": 18,
+    "where": "AttentionBlockFused.sdpa (even layers 0,2,4...34 with sliding_window=128)",
+    "source": {
+      "module": "ScaledDotProductAttentionFused",
+      "code": "def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, S: torch.Tensor) -> torch.Tensor:\n    n_tokens, n_heads, q_mult, d_head = Q.shape\n    K = K[:, :, None, :].expand(-1, -1, q_mult, -1)\n    V = V[:, :, None, :].expand(-1, -1, q_mult, -1)\n    S = S.reshape(n_heads, q_mult, 1, 1).expand(-1, -1, n_tokens, -1)\n    mask = torch.triu(Q.new_full((n_tokens, n_tokens), -float(\"inf\")), diagonal=1)\n    if self.sliding_window > 0:\n        mask += torch.tril(mask.new_full((n_tokens, n_tokens), -float(\"inf\")), diagonal=-self.sliding_window)\n    QK = torch.einsum(\"qhmd,khmd->hmqk\", Q, K)\n    QK *= self.sm_scale\n    QK += mask[None, None, :, :]\n    QK = torch.cat([QK, S], dim=-1)\n    W = torch.softmax(QK, dim=-1)\n    W = W[..., :-1]\n    attn = torch.einsum(\"hmqk,khmd->qhmd\", W, V)\n    return attn.reshape(n_tokens, -1)"
+    }
+  },
+  {
+    "id": "sdpa_no_sliding_window_sinks",
+    "type": "ScaledDotProductAttentionFused",
+    "data_layout": null,
+    "dtype": "bfloat16",
+    "ops": [
+      {"op": "expand", "k_expand": ["n_tokens", "n_heads", "q_mult", "d_head"]},
+      {"op": "expand", "v_expand": ["n_tokens", "n_heads", "q_mult", "d_head"]},
+      {"op": "triu", "diagonal": 1, "fill_value": "-inf"},
+      {"op": "einsum", "pattern": "qhmd,khmd->hmqk"},
+      {"op": "mul", "sm_scale": 0.125},
+      {"op": "add", "mask": true},
+      {"op": "cat", "sinks": true, "dim": -1},
+      {"op": "softmax", "dim": -1},
+      {"op": "slice", "drop_sink": true},
+      {"op": "einsum", "pattern": "hmqk,khmd->qhmd"}
+    ],
+    "inputs": [["n_tokens", 8, 8, 64], ["n_tokens", 8, 64], ["n_tokens", 8, 64], [64]],
+    "output_shape": ["n_tokens", 4096],
+    "weights_fused": null,
+    "weights_original": null,
+    "count": 18,
+    "where": "AttentionBlockFused.sdpa (odd layers 1,3,5...35 with sliding_window=0)",
+    "source": {
+      "module": "ScaledDotProductAttentionFused",
+      "code": "def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, S: torch.Tensor) -> torch.Tensor:\n    n_tokens, n_heads, q_mult, d_head = Q.shape\n    K = K[:, :, None, :].expand(-1, -1, q_mult, -1)\n    V = V[:, :, None, :].expand(-1, -1, q_mult, -1)\n    S = S.reshape(n_heads, q_mult, 1, 1).expand(-1, -1, n_tokens, -1)\n    mask = torch.triu(Q.new_full((n_tokens, n_tokens), -float(\"inf\")), diagonal=1)\n    QK = torch.einsum(\"qhmd,khmd->hmqk\", Q, K)\n    QK *= self.sm_scale\n    QK += mask[None, None, :, :]\n    QK = torch.cat([QK, S], dim=-1)\n    W = torch.softmax(QK, dim=-1)\n    W = W[..., :-1]\n    attn = torch.einsum(\"hmqk,khmd->qhmd\", W, V)\n    return attn.reshape(n_tokens, -1)"
+    }
+  },
+  {
+    "id": "attn_output_projection",
+    "type": "Linear",
+    "data_layout": null,
+    "dtype": "bfloat16",
+    "ops": [
+      {"op": "linear", "in_features": 4096, "out_features": 2880, "bias": true}
+    ],
+    "input_shape": ["num_tokens", 4096],
+    "output_shape": ["num_tokens", 2880],
+    "weights_fused": {
+      "out.weight": [2880, 4096],
+      "out.bias": [2880]
+    },
+    "weights_original": {
+      "out.weight": [2880, 4096],
+      "out.bias": [2880]
+    },
+    "count": 36,
+    "where": "AttentionBlockFused.out (all 36 layers)",
+    "source": {
+      "module": "nn.Linear",
+      "code": "self.out = nn.Linear(config.head_dim * config.num_attention_heads, config.hidden_size, device=device, dtype=torch.bfloat16)"
+    }
+  },
+  {
+    "id": "residual_add_attn",
+    "type": "ResidualAdd",
+    "data_layout": null,
+    "dtype": "bfloat16",
+    "ops": [
+      {"op": "add"}
+    ],
+    "inputs": [["num_tokens", 2880], ["num_tokens", 2880]],
+    "output_shape": ["num_tokens", 2880],
+    "weights_fused": null,
+    "weights_original": null,
+    "count": 36,
+    "where": "AttentionBlockFused.forward residual + t (all 36 layers)",
+    "source": {
+      "module": "AttentionBlockFused",
+      "code": "return residual + t"
+    }
+  },
+  {
+    "id": "expert_gating",
+    "type": "ExpertGating",
+    "data_layout": null,
+    "dtype": "bfloat16",
+    "ops": [
+      {"op": "linear", "in_features": 2880, "out_features": 128, "bias": true},
+      {"op": "topk", "k": 4, "dim": -1, "sorted": true},
+      {"op": "softmax", "dim": 1}
+    ],
+    "input_shape": ["num_tokens", 2880],
+    "output_shape": [["num_tokens", 4], ["num_tokens", 4]],
+    "weights_fused": {
+      "gate.weight": [128, 2880],
+      "gate.bias": [128]
+    },
+    "weights_original": {
+      "gate.weight": [128, 2880],
+      "gate.bias": [128]
+    },
+    "count": 36,
+    "where": "MLPBlockFused.gating (all 36 layers)",
+    "source": {
+      "module": "ExpertGating",
+      "code": "def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:\n    g = self.gate(x)\n    experts = torch.topk(g, k=self.experts_per_token, dim=-1, sorted=True)\n    expert_weights = torch.nn.functional.softmax(experts.values, dim=1)\n    expert_indices = experts.indices\n    return expert_weights, expert_indices"
+    }
+  },
+  {
+    "id": "swiglu_activation",
+    "type": "SwiGLUFused",
+    "data_layout": null,
+    "dtype": "bfloat16",
+    "ops": [
+      {"op": "slice", "glu_part": "::2"},
+      {"op": "slice", "linear_part": "1::2"},
+      {"op": "clamp", "max": 7.0},
+      {"op": "clamp", "min": -7.0, "max": 7.0},
+      {"op": "sigmoid"},
+      {"op": "mul"},
+      {"op": "add", "scalar": 1},
+      {"op": "mul"}
+    ],
+    "input_shape": ["batch", "num_experts", 5760],
+    "output_shape": ["batch", "num_experts", 2880],
+    "weights_fused": null,
+    "weights_original": null,
+    "count": 36,
+    "where": "MoEMLPFused.swiglu (all 36 layers)",
+    "source": {
+      "module": "SwiGLUFused",
+      "code": "def forward(self, x: torch.Tensor) -> torch.Tensor:\n    x_glu, x_linear = x[..., ::2], x[..., 1::2]\n    x_glu = x_glu.clamp(min=None, max=self.limit)\n    x_linear = x_linear.clamp(min=-self.limit, max=self.limit)\n    out_glu = x_glu * torch.sigmoid(self.alpha * x_glu)\n    return out_glu * (x_linear + 1)"
+    }
+  },
+  {
+    "id": "moe_mlp_fused",
+    "type": "MoEMLPFused",
+    "data_layout": null,
+    "dtype": "bfloat16",
+    "ops": [
+      {"op": "gather", "expert_indices": ["num_tokens", 4]},
+      {"op": "einsum", "pattern": "beck,bk->bec"},
+      {"op": "add", "mlp1_bias": true},
+      {"op": "swiglu"},
+      {"op": "gather", "expert_indices": ["num_tokens", 4]},
+      {"op": "einsum", "pattern": "beck,bek->bec"},
+      {"op": "all_reduce", "conditional": "world_size > 1"},
+      {"op": "add", "mlp2_bias": true},
+      {"op": "einsum", "pattern": "bec,be->bc"}
+    ],
+    "inputs": [["num_tokens", 2880], ["num_tokens", 4], ["num_tokens", 4]],
+    "output_shape": ["num_tokens", 2880],
+    "weights_fused": {
+      "mlp1_weight": [128, 5760, 2880],
+      "mlp1_bias": [128, 5760],
+      "mlp2_weight": [128, 2880, 2880],
+      "mlp2_bias": [128, 2880]
+    },
+    "weights_original": {
+      "mlp1_weight": [128, 5760, 2880],
+      "mlp1_bias": [128, 5760],
+      "mlp2_weight": [128, 2880, 2880],
+      "mlp2_bias": [128, 2880]
+    },
+    "count": 36,
+    "where": "MLPBlockFused.moe_mlp (all 36 layers)",
+    "source": {
+      "module": "MoEMLPFused",
+      "code": "def forward(self, x: torch.Tensor, expert_indices: torch.Tensor, expert_weights: torch.Tensor) -> torch.Tensor:\n    mlp1_weight = self.mlp1_weight[expert_indices, ...]\n    mlp1_bias = self.mlp1_bias[expert_indices, ...]\n    t = torch.einsum(\"beck,bk->bec\", mlp1_weight, x) + mlp1_bias\n    t = self.swiglu(t)\n    mlp2_weight = self.mlp2_weight[expert_indices, ...]\n    mlp2_bias = self.mlp2_bias[expert_indices, ...]\n    t = torch.einsum(\"beck,bek->bec\", mlp2_weight, t)\n    if self.world_size > 1:\n        dist.all_reduce(t, op=dist.ReduceOp.SUM)\n    t += mlp2_bias\n    t = torch.einsum(\"bec,be->bc\", t, expert_weights)\n    return t"
+    }
+  },
+  {
+    "id": "residual_add_mlp",
+    "type": "ResidualAdd",
+    "data_layout": null,
+    "dtype": "bfloat16",
+    "ops": [
+      {"op": "add"}
+    ],
+    "inputs": [["num_tokens", 2880], ["num_tokens", 2880]],
+    "output_shape": ["num_tokens", 2880],
+    "weights_fused": null,
+    "weights_original": null,
+    "count": 36,
+    "where": "MLPBlockFused.forward residual + t (all 36 layers)",
+    "source": {
+      "module": "MLPBlockFused",
+      "code": "return residual + t"
+    }
+  },
+  {
+    "id": "embedding",
+    "type": "Embedding",
+    "data_layout": null,
+    "dtype": "bfloat16",
+    "ops": [
+      {"op": "embedding", "num_embeddings": 201088, "embedding_dim": 2880}
+    ],
+    "input_shape": ["num_tokens"],
+    "output_shape": ["num_tokens", 2880],
+    "weights_fused": {
+      "embedding.weight": [201088, 2880]
+    },
+    "weights_original": {
+      "embedding.weight": [201088, 2880]
+    },
+    "count": 1,
+    "where": "TransformerFused.embedding",
+    "source": {
+      "module": "nn.Embedding",
+      "code": "self.embedding = nn.Embedding(config.vocab_size, config.hidden_size, device=device, dtype=torch.bfloat16)"
+    }
+  },
+  {
+    "id": "unembedding",
+    "type": "Linear",
+    "data_layout": null,
+    "dtype": "bfloat16",
+    "ops": [
+      {"op": "linear", "in_features": 2880, "out_features": 201088, "bias": false}
+    ],
+    "input_shape": ["num_tokens", 2880],
+    "output_shape": ["num_tokens", 201088],
+    "weights_fused": {
+      "unembedding.weight": [201088, 2880]
+    },
+    "weights_original": {
+      "unembedding.weight": [201088, 2880]
+    },
+    "count": 1,
+    "where": "TransformerFused.unembedding",
+    "source": {
+      "module": "nn.Linear",
+      "code": "self.unembedding = nn.Linear(config.hidden_size, config.vocab_size, bias=False, device=device, dtype=torch.bfloat16)"
+    }
+  }
+]
