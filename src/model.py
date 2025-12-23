@@ -43,6 +43,7 @@ import re
 import torch
 
 
+
 def convert_gptoss_to_neuron_state_dict(
     gptoss_sd: dict,
     config,
@@ -203,6 +204,80 @@ def convert_gptoss_to_neuron_state_dict(
         gptoss_sd.clear()
         gc.collect()
         return nsd
+
+class NeuronGPTOSSRotaryEmbedding(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        max_position_embeddings: int,
+        base: float = 150000,
+        scaling_factor: float = 32.0,
+        original_max_position_embeddings: int = 4096,
+    ):
+        
+        super().__init__()
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        self.scaling_factor = scaling_factor
+        self.original_max_position_embeddings = original_max_position_embeddings
+        self.attention_scaling = self._get_mscale(scaling_factor)
+
+        low, high = self._find_correction_range(
+            low_rot=scaling_factor,
+            high_rot=1.0,
+            dim=dim,
+            base=base,˜
+            max_position_embeddings=original_max_position_embeddings
+        )
+
+        inv_freq_extrapolation_factor = 1 - self._linear_ramp_factor(low, high, dim // 2)
+        pos_freqs = base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
+        inv_freq_extrapolation = 1.0 / pos_freqs
+        inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
+        inv_freq = (
+            inv_freq_interpolation * (1 - inv_freq_extrapolation_factor) +
+            inv_freq_extrapolation * inv_freq_extrapolation_factor
+        )
+
+        self.register_buffer('inv_freq', inv_freq, persistent=False)
+        self.original_inv_freq = self.inv_freq
+
+# may not need inside the class if exists outside
+    def _get_mscale(self, scale: float, mscale: float = 1.0) -> float:
+        return 0.1 * mscale * math.log(scale) + 1.0
+
+    def _find_correction_dim(self, num_rotations: float, dim: int, base: float, max_position_embeddings: int) -> float:
+        return dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi)) / (2 * math.log(base))
+
+    def _find_correction_range(self, low_rot: float, high_rot: float, dim: int, base: float, max_position_embeddings: int) -> tuple[float, float]:
+        low = self._find_correction_dim(low_rot, dim, base, max_position_embeddings)
+        high = self._find_correction_dim(high_rot, dim, base, max_position_embeddings)
+        return (max(low, 0), min(high, dim - 1))
+
+    def _linear_ramp_factor(self, min_val: float, max_val: float, dim: int) -> torch.Tensor:
+        linear_func = (torch.arange(dim, dtype=torch.float32) - min_val) / (max_val - min_val)
+        ramp_func = torch.clamp(linear_func, 0, 1)
+        return ramp_func
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor, position_ids: torch.LongTensor) -> tuple[torch.Tensor, torch.Tensor]:
+        inv_freq_expanded = (
+            self.inv_freq[None, :, None]
+            .float()
+            .expand(position_ids.shape[0], -1, 1)
+            .to(x.device)
+        )
+        position_ids_expanded = position_ids[:, None, :].float()
+        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != 'mps' else 'cpu'
+
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = freqs
+            cos = emb.cos() * self.attention_scaling
+            sin = emb.sin() * self.attention_scaling
+
+        return (cos.to(x.dtype), sin.to(x.dtype))
 
 class NeuronGPTOSSConfig(MoENeuronConfig):
     def __init__(self, **kwargs):
