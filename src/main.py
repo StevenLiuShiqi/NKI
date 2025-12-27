@@ -1,6 +1,11 @@
 import argparse
 import time
 import copy
+import sys
+import os
+
+# Add parent directory to path to find gpt_oss package
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), ".")))
 
 from transformers import AutoTokenizer, GenerationConfig
 
@@ -9,6 +14,7 @@ from neuronx_distributed_inference.utils.accuracy import get_generate_outputs
 from neuronx_distributed_inference.modules.generation.sampling import prepare_sampling_params
 
 from model import NeuronGPTOSSForCausalLM
+from gpt_oss.modeling_gpt_oss_orig import NeuronGptOssForCausalLM
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -42,7 +48,7 @@ def parse_args():
     # parser.add_argument("--vocab-parallel", action="store_true")
 
     # # Attention
-    # parser.add_argument("--fused-qkv", action="store_true")
+    parser.add_argument("--fused-qkv", dest="fused_qkv", type=bool, default=False)
     # parser.add_argument("--sequence-parallel-enabled", action="store_true")
     # parser.add_argument("--flash-decoding-enabled", action="store_true")
 
@@ -57,6 +63,10 @@ def parse_args():
 
     # # Parallelism
     parser.add_argument("--tp-degree", dest="tp_degree", type=int, default=8)
+    
+    # Padding
+    parser.add_argument("--padded-hidden-size", dest="padded_hidden_size", type=int, default=2944,
+                        help="Padded hidden size (must be >= hidden_size and divisible by 128 for MoE kernel)")
 
     # # Kernels
     # parser.add_argument("--qkv-kernel-enabled", action="store_true")
@@ -98,6 +108,8 @@ def prepare_inference(model_cls, args):
         "fused_qkv", "sequence_parallel_enabled", "flash_decoding_enabled",
         "enable_bucketing", "bucket_n_active_tokens",
         "context_encoding_buckets", "token_generation_buckets",
+        # padding
+        "padded_hidden_size", "padded_intermediate_size",
     }
 
     # Keys that *do not* belong to NeuronConfig 
@@ -109,6 +121,8 @@ def prepare_inference(model_cls, args):
     driver_only = {"seq_len", "batch_size", "max_length", "tol_map", "padding_side"}
 
     # Build kwargs for each consumer
+    config_kwargs["original_hidden_size"] = 2880
+    config_kwargs["is_mxfp4_compute"] = False
     neuron_kwargs = {k: config_kwargs[k] for k in neuron_keys if k in config_kwargs and config_kwargs[k] is not None}
     # (Do NOT pass generation/path args into NeuronConfig)
 
@@ -192,7 +206,7 @@ def main():
     args.max_length = args.seq_len
     args.tol_map = "{None: (1e-5, 0.05), 1000: (1e-5, 0.03), 50: (1e-5, 0.03), 5: (1e-5, 0.03)}"
 
-    model, tokenizer, generation_config = prepare_inference(NeuronGPTOSSForCausalLM, args)
+    model, tokenizer, generation_config = prepare_inference(NeuronGptOssForCausalLM, args)
     
     print("Compiled!")
     
