@@ -227,7 +227,7 @@ class NeuronGPTOSSRotaryEmbedding(nn.Module):
             low_rot=scaling_factor,
             high_rot=1.0,
             dim=dim,
-            base=base,˜
+            base=base,
             max_position_embeddings=original_max_position_embeddings
         )
 

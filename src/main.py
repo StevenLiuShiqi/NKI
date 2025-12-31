@@ -14,7 +14,7 @@ from neuronx_distributed_inference.utils.accuracy import get_generate_outputs
 from neuronx_distributed_inference.modules.generation.sampling import prepare_sampling_params
 
 from model import NeuronGPTOSSForCausalLM
-from gpt_oss.modeling_gpt_oss_orig import NeuronGptOssForCausalLM
+from src.gpt_oss.modeling_gpt_oss_orig import NeuronGptOssForCausalLM
 
 def parse_args():
     parser = argparse.ArgumentParser()
