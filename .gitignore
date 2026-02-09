@@ -26,3 +26,5 @@ global_metric_store.json
 
 .ipynb_checkpoints/
 .DS_Store
+
+parquet_files/

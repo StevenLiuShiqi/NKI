@@ -12,9 +12,17 @@ from transformers import AutoTokenizer, GenerationConfig
 from neuronx_distributed_inference.utils.hf_adapter import load_pretrained_config, HuggingFaceGenerationAdapter
 from neuronx_distributed_inference.utils.accuracy import get_generate_outputs
 from neuronx_distributed_inference.modules.generation.sampling import prepare_sampling_params
+from neuronx_distributed_inference.utils.benchmark import benchmark_sampling
 
 from model import NeuronGPTOSSForCausalLM
 from src.gpt_oss.modeling_gpt_oss_orig import NeuronGptOssForCausalLM
+
+# os.environ["NEURON_FRAMEWORK_DEBUG"] = "1"
+# os.environ["XLA_IR_DEBUG"]= "1"
+# os.environ["XLA_HLO_DEBUG"]= "1"
+# os.environ["NEURON_RT_INSPECT_ENABLE"]= "1"
+# os.environ["NEURON_RT_INSPECT_DEVICE_PROFILE"]= "1"
+# os.environ["NEURON_RT_INSPECT_OUTPUT_DIR"]= "./output"
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -32,6 +40,8 @@ def parse_args():
     parser.add_argument("--do-sample", type=bool, default=True)
     parser.add_argument("--dynamic", action="store_true")
     parser.add_argument("--pad-token-id", type=int, default=2)
+    parser.add_argument("--run-accuracy-generate", action="store_true",
+                        help="Also run get_generate_outputs() after HF adapter generate")
     
     # Basic config
     # parser.add_argument("--torch-dtype", type=to_torch_dtype, default="bfloat16")
@@ -68,6 +78,14 @@ def parse_args():
     parser.add_argument("--padded-hidden-size", dest="padded_hidden_size", type=int, default=2944,
                         help="Padded hidden size (must be >= hidden_size and divisible by 128 for MoE kernel)")
 
+    # Benchmarking
+    parser.add_argument("--benchmark", action="store_true",
+                       help="Enable benchmarking mode to measure latency and throughput")
+    parser.add_argument("--benchmark-report-path", type=str, default="./benchmark_report.json",
+                       help="Path to save benchmark results JSON file")
+    parser.add_argument("--num-benchmark-runs", type=int, default=20,
+                       help="Number of benchmark iterations for statistical accuracy")
+
     # # Kernels
     # parser.add_argument("--qkv-kernel-enabled", action="store_true")
     # parser.add_argument("--attn-kernel-enabled", action="store_true")
@@ -99,7 +117,7 @@ def prepare_inference(model_cls, args):
      # Keys that belong to Neuron*Config
     neuron_keys = {
         # common MoE/Neuron runtime knobs; 
-        "tp_degree", "max_batch_size", "buckets",
+        "tp_degree", "batch_size", "max_batch_size", "buckets",
         "torch_dtype", "on_device_sampling_config",
         # kernel toggles 
         "qkv_kernel_enabled", "attn_kernel_enabled", "mlp_kernel_enabled",
@@ -110,6 +128,10 @@ def prepare_inference(model_cls, args):
         "context_encoding_buckets", "token_generation_buckets",
         # padding
         "padded_hidden_size", "padded_intermediate_size",
+        # sequence/bucket sizing
+        "seq_len", "max_length", "n_positions", "n_active_tokens", "max_context_length",
+        # tokenizer / mask layout
+        "padding_side",
     }
 
     # Keys that *do not* belong to NeuronConfig 
@@ -124,6 +146,10 @@ def prepare_inference(model_cls, args):
     config_kwargs["original_hidden_size"] = 2880
     config_kwargs["is_mxfp4_compute"] = False
     neuron_kwargs = {k: config_kwargs[k] for k in neuron_keys if k in config_kwargs and config_kwargs[k] is not None}
+    # Keep compiled/runtime batch dimensions aligned to avoid sequential fallback in ModelWrapper.
+    if "batch_size" in config_kwargs and config_kwargs["batch_size"] is not None:
+        neuron_kwargs["batch_size"] = config_kwargs["batch_size"]
+        neuron_kwargs.setdefault("max_batch_size", config_kwargs["batch_size"])
     # (Do NOT pass generation/path args into NeuronConfig)
 
     # if args.on_device_sampling:
@@ -197,6 +223,43 @@ def run_generation(model, tokenizer, prompts, generation_config):
         print(f"Output {i}: {output_token}")
 
 
+def run_benchmarking(model, generation_config, num_runs, benchmark_report_path):
+    """
+    Run comprehensive benchmarking on the model.
+
+    Args:
+        model: Neuron model instance (NeuronGptOssForCausalLM)
+        generation_config: GenerationConfig object with sampling parameters
+        num_runs: Number of benchmark iterations
+        benchmark_report_path: Path to save JSON results
+
+    Returns:
+        dict: Benchmark results containing latency percentiles and throughput
+    """
+    print(f"\nStarting benchmark with {num_runs} runs...")
+    print(f"Results will be saved to: {benchmark_report_path}")
+
+    results = benchmark_sampling(
+        model=model,
+        draft_model=None,
+        generation_config=generation_config,
+        target="all",
+        image=False,
+        num_runs=num_runs,
+        benchmark_report_path=benchmark_report_path,
+    )
+
+    print("\nBenchmark Summary:")
+    if "e2e_model" in results:
+        e2e = results["e2e_model"]
+        print(f"  End-to-End Latency (avg): {e2e['latency_ms_avg']:.2f} ms")
+        print(f"  End-to-End Latency (P50): {e2e['latency_ms_p50']:.2f} ms")
+        print(f"  End-to-End Latency (P99): {e2e['latency_ms_p99']:.2f} ms")
+        print(f"  Throughput: {e2e['throughput']:.2f} tokens/sec")
+
+    return results
+
+
 def main():
     args = parse_args()
 
@@ -210,10 +273,22 @@ def main():
     
     print("Compiled!")
     
-    sampling_params = prepare_sampling_params(batch_size=model.neuron_config.batch_size, top_k=[10, 5], top_p=[0.5, 0.9],  temperature=[0.9, 0.5])
+    batch_size = model.neuron_config.batch_size
+    sampling_params = prepare_sampling_params(
+        batch_size=batch_size,
+        top_k=[args.top_k] * batch_size,
+        top_p=[args.top_p] * batch_size,
+        temperature=[args.temperature] * batch_size,
+    )
     print(f"Prompts: {args.prompts}")
     inputs = tokenizer(args.prompts, padding=True, return_tensors="pt")
     print(f"Input ids: {inputs}")
+    if inputs.input_ids.shape[0] > model.neuron_config.batch_size:
+        raise RuntimeError(
+            f"Runtime batch ({inputs.input_ids.shape[0]}) exceeds compiled batch "
+            f"({model.neuron_config.batch_size}). This can cause KV-cache contamination. "
+            "Recompile with matching NeuronConfig batch_size/max_batch_size."
+        )
     
     generation_model = HuggingFaceGenerationAdapter(model)
     outputs = generation_model.generate(
@@ -228,12 +303,22 @@ def main():
     for i, output_token in enumerate(output_tokens):
         print(f"Output {i}: {output_token}")
     
-    run_generation(
-        model,
-        tokenizer,
-        args.prompts,
-        generation_config
-    )
-    
+    if args.run_accuracy_generate:
+        run_generation(
+            model,
+            tokenizer,
+            args.prompts,
+            generation_config
+        )
+
+    # Benchmarking integration (optional, runs when --benchmark flag is set)
+    if args.benchmark:
+        run_benchmarking(
+            model=model,
+            generation_config=generation_config,
+            num_runs=args.num_benchmark_runs,
+            benchmark_report_path=args.benchmark_report_path
+        )
+
 if __name__ == "__main__":
     main()

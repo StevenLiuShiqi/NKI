@@ -212,7 +212,16 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
             outputs = self(**model_inputs, return_dict=True)
 
             if outputs.logits is not None:
-                next_token_logits = outputs.logits[:, -1, :].clone()
+                if self.padding_side == "right" and model_kwargs.get("attention_mask") is not None:
+                    attn = model_kwargs["attention_mask"]
+                    # pick the last non-pad position, even if mask has holes
+                    last_idx = attn.shape[1] - 1 - torch.flip(attn, dims=[1]).long().argmax(dim=1)
+                    seq_len_logits = outputs.logits.shape[1]
+                    last_idx = torch.clamp(last_idx, max=seq_len_logits - 1)
+                    batch_idx = torch.arange(attn.shape[0], device=outputs.logits.device)
+                    next_token_logits = outputs.logits[batch_idx, last_idx, :].clone()
+                else:
+                    next_token_logits = outputs.logits[:, -1, :].clone()
 
                 # pre-process distribution
                 next_token_scores = logits_processor(input_ids, next_token_logits)
@@ -305,7 +314,10 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
                 position_ids.masked_fill_(attention_mask == 0, 1)
 
             if self.neuron_model.kv_cache_populated:
-                position_ids = torch.amax(position_ids, 1, keepdim=True)
+                # CRITICAL: Compute max per sample along sequence dimension (dim=1)
+                # This ensures each batch element maintains independent position tracking
+                # to prevent batch contamination. Shape: [batch_size, 1]
+                position_ids = torch.amax(position_ids, dim=1, keepdim=True)
                 position_ids = position_ids + 1
 
         # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
@@ -400,7 +412,7 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
                     attention_mask = attention_mask[:, 1:]
                 else:
                     attention_mask = torch.cat(
-                        [attention_mask.new_ones((attention_mask.shape[0], 1)), attention_mask],
+                        [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))],
                         dim=-1,
                     )
             model_kwargs["attention_mask"] = attention_mask
@@ -429,8 +441,8 @@ class HuggingFaceGenerationAdapter(PreTrainedModel, GenerationMixin):
             else:
                 attention_mask = torch.cat(
                     [
-                        attention_mask.new_ones((attention_mask.shape[0], accepted_len)),
                         attention_mask,
+                        attention_mask.new_ones((attention_mask.shape[0], accepted_len)),
                     ],
                     dim=-1,
                 )

@@ -59,6 +59,10 @@ from neuronx_distributed_inference.utils.distributed import get_tp_group
 
 from transformers import GptOssForCausalLM
 
+# Profiling
+os.environ["NEURON_FRAMEWORK_DEBUG"] = "1"
+os.environ["XLA_IR_DEBUG"]= "1"
+os.environ["XLA_HLO_DEBUG"]= "1"
 
 logger = logging.getLogger("Neuron")
 
@@ -640,6 +644,7 @@ class NeuronGptOssAttention(NeuronAttentionBase):
         self,
         config: InferenceConfig,
     ):
+        # config.neuron_config.attn_kernel_enabled = True
         super().__init__(
             config=config,
             hidden_size=config.hidden_size,
