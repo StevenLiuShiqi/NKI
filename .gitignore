@@ -25,3 +25,5 @@ global_metric_store.json
 *.log
 
 .ipynb_checkpoints/
+
+parquet_files/
